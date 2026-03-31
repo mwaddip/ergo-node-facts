@@ -11,7 +11,7 @@ block validation (checks header membership).
 ## Phase 1: Header Awareness
 
 ### `parse_header(body: &[u8]) -> Result<Header>`
-- **Precondition**: `body` is the raw payload from a ModifierResponse with modifier_type = 1.
+- **Precondition**: `body` is the raw payload from a ModifierResponse with modifier_type = 101 (Header).
 - **Postcondition**: Returns a fully populated `ergo-chain-types::Header` or an error.
   Never panics on malformed input.
 
