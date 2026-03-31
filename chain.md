@@ -81,6 +81,29 @@ parent linkage, PoW validity, timestamp bounds, and correct difficulty.
 - **Invariant**: For any two correct implementations given the same chain, the output is identical.
   This is consensus-critical — must match the JVM node exactly.
 
+## SyncInfo Serialization
+
+Build and parse SyncInfo messages (P2P message code 65). Used by the sync
+state machine to compare chain tips with peers.
+
+Two wire formats exist. V2 is used by all current nodes (>= 4.0.16).
+
+### `build_sync_info(headers: &[Header]) -> Vec<u8>`
+- **Precondition**: `headers` contains up to 50 recent headers from the chain tip.
+- **Postcondition**: Returns V2 SyncInfo body bytes ready for framing.
+- **Format**: `[0x00, 0x00][0xFF][count: 1 byte][header_size: VLQ u16, header_bytes] × count`
+- The `[0x00, 0x00]` prefix (count=0 in V1 framing) signals V2 to older parsers.
+
+### `parse_sync_info(body: &[u8]) -> Result<SyncInfo>`
+- **Precondition**: `body` is the raw payload from a SyncInfo message (code 65).
+- **Postcondition**: Returns parsed sync info — either V1 (header IDs only) or V2 (full headers).
+- Never panics on malformed input.
+- Rejects V2 messages with more than 50 headers or headers larger than 1000 bytes.
+
+### `SyncInfo` enum
+- `V1 { header_ids: Vec<BlockId> }` — legacy, list of 32-byte header IDs
+- `V2 { headers: Vec<Header> }` — current, full serialized headers
+
 ## Invariants (all phases)
 
 - No method panics on untrusted input.
