@@ -56,7 +56,10 @@ L  Luck          Edge cases. Race conditions, timing, the 3 AM failures, "works 
 
 ## Stat Profiles
 
-### P2P Networking (`ergo-proxy-node`)
+### Submodule: `p2p/` (enr-p2p)
+
+P2P networking layer. Evolving from message-forwarding proxy to state-aware
+peer implementation. Accepts connections from untrusted peers on the open internet.
 
 ```
 default                           S8  P10 E9  C5  I7  A7  L9
@@ -69,7 +72,12 @@ handshake / peer management       S9  P10 E8  C5  I6  A6  L9
   Eclipse attacks, Sybil, protocol confusion — all start at the handshake.
 ```
 
-### Header Chain Validation
+Contracts: `p2p-transport.md`, `p2p-protocol.md`, `p2p-routing.md`
+
+### Submodule: `chain/` (enr-chain)
+
+Header chain validation, PoW verification, difficulty adjustment, NiPoPoW.
+Everything needed to answer "is this chain of headers valid?"
 
 ```
 default                           S9  P7  E8  C6  I8  A7  L8
@@ -81,7 +89,36 @@ difficulty adjustment              S9  P6  E7  C5  I7  A8  L9
   Performance matters — recalculated per header during sync.
 ```
 
-### Block Validation
+### Submodule: `state/` (enr-state)
+
+UTXO state management via AVL+ authenticated tree. Apply blocks, rollback,
+crash recovery.
+
+```
+default                           S8  P6  E10 C6  I9  A8  L9
+  Crash recovery IS the product. If the AVL+ tree gets corrupted mid-block-apply,
+  the node must recover without manual intervention. Rollback must be atomic.
+  Architecture is critical — wrong abstraction over the AVL tree cascades everywhere.
+  Performance matters — this is the bottleneck during initial sync.
+```
+
+### Submodule: `store/` (enr-store)
+
+Persistent storage for headers, blocks, and modifiers. The durability layer
+that everything else reads from and writes to.
+
+```
+default                           S7  P5  E9  C6  I7  A8  L7
+  Data durability. Writes must be atomic or recoverable. Performance matters
+  during initial sync (thousands of blocks per second). Internal component —
+  no untrusted input, hence lower P.
+```
+
+### Workspace crate: `ergo-validation`
+
+Block-level validation — composes header checks (from `chain/`), transaction
+validation (from `ergo-lib`), AD proof verification, and UTXO lookups (from
+`state/`). Mostly glue, but consensus-critical glue.
 
 ```
 default                           S10 P8  E7  C5  I9  A7  L9
@@ -94,17 +131,10 @@ transaction validation             S9  P8  E6  C5  I8  A7  L8
   Must handle all script types, storage rent, token preservation.
 ```
 
-### UTXO State Management
+### Workspace crate: `ergo-mempool`
 
-```
-default                           S8  P6  E10 C6  I9  A8  L9
-  Crash recovery IS the product. If the AVL+ tree gets corrupted mid-block-apply,
-  the node must recover without manual intervention. Rollback must be atomic.
-  Architecture is critical — wrong abstraction over the AVL tree cascades everywhere.
-  Performance matters — this is the bottleneck during initial sync.
-```
-
-### Mempool
+Transaction pool. Ordering, eviction, double-spend detection. Not persistent —
+crash means empty mempool, which is acceptable.
 
 ```
 default                           S7  P7  E6  C6  I7  A8  L8
@@ -114,7 +144,10 @@ default                           S7  P7  E6  C6  I7  A8  L8
   Edge cases: conflicting transactions, replacement policies, fee bumping.
 ```
 
-### Chain Sync State Machine
+### Workspace crate: `ergo-sync`
+
+Chain sync state machine. Coordinates P2P requests, storage writes, and
+validation across full/digest/UTXO-snapshot sync modes.
 
 ```
 default                           S8  P7  E10 C6  I9  A6  L9
@@ -124,16 +157,9 @@ default                           S8  P7  E10 C6  I9  A6  L9
   significant logic — wrong boundaries mean copy-pasting state machines.
 ```
 
-### Block / Modifier Storage
+### Workspace crate: `ergo-api`
 
-```
-default                           S7  P5  E9  C6  I7  A8  L7
-  Data durability. Writes must be atomic or recoverable. Performance matters
-  during initial sync (thousands of blocks per second). Internal component —
-  no untrusted input, hence lower P.
-```
-
-### REST API
+REST API. External-facing query and submission interface.
 
 ```
 default                           S8  P9  E6  C8  I6  A6  L5
@@ -142,7 +168,10 @@ default                           S8  P9  E6  C8  I6  A6  L5
   developers stare at this API. Not a long-running critical process.
 ```
 
-### Integration / Orchestration (main crate)
+### Main crate: `ergo-node-rust`
+
+Integration and orchestration. Wires submodules and workspace crates together.
+Startup, configuration, component lifecycle.
 
 ```
 default                           S7  P6  E8  C7  I10 A6  L7
