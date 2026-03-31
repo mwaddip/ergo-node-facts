@@ -42,7 +42,7 @@
 - Mode filtering: Light mode drops SyncInfo and block-related ModifierRequests.
 - GetPeers: responded to directly from peer registry.
 - Inv: forwarded to all peers of opposite direction.
-- ModifierRequest: routed via Inv table to the announcing peer.
+- ModifierRequest: routed via Inv table to the announcing peer if known. If no Inv entry exists, forwarded to any available outbound peer as fallback (enables chain sync, where modifier IDs come from SyncInfo rather than Inv).
 - ModifierResponse: routed via request tracker to the requester.
 - SyncInfo: routed via sync tracker (inbound↔outbound pairing).
 - Unknown: forwarded to all peers of opposite direction.
