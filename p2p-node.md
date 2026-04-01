@@ -4,10 +4,10 @@
 
 The handle to a running P2P layer. Created by `P2pNode::start()`. The P2P layer runs as background tokio tasks — the caller owns the runtime.
 
-### `start(config, validator) -> Result<P2pNode>`
+### `start(config, modifier_sink) -> Result<P2pNode>`
 - **Precondition**: Called within a tokio runtime.
 - **Postcondition**: Listeners, outbound connections, keepalive, and event loop are spawned as background tasks. Returns immediately.
-- If `validator` is `Some`, it is called for every modifier in a `ModifierResponse` before forwarding.
+- If `modifier_sink` is `Some`, every modifier from a `ModifierResponse` is sent to the channel as `(modifier_type, id, data)` via the `Action::Validate` mechanism. The P2P layer never blocks on validation.
 
 ### `peer_count() -> usize`
 - Returns the number of currently connected peers (inbound + outbound).
@@ -33,8 +33,14 @@ The handle to a running P2P layer. Created by `P2pNode::start()`. The P2P layer 
 
 ### `subscribe() -> Receiver<ProtocolEvent>`
 - Returns a channel receiver that receives a copy of every protocol event (incoming messages, peer connect/disconnect) before the router processes it.
-- Bounded channel: if the subscriber falls behind, events are dropped (not blocking the event loop).
+- Bounded channel (256): if the subscriber falls behind, events are dropped (not blocking the event loop).
 - The subscriber sees raw events — the router may subsequently drop, reroute, or transform them.
+
+## Router: Action::Validate
+
+The router emits `Action::Validate { modifier_type, id, data }` for each modifier in a `ModifierResponse`. The event loop dispatches these to the `modifier_sink` channel via `try_send` (non-blocking). If no sink is provided, validate actions are dropped (pure proxy mode).
+
+The router does NOT validate modifiers. It routes them, emits them for external validation, and forwards to requesters. Validation is the pipeline's job.
 
 ## Invariants
 
@@ -42,3 +48,4 @@ The handle to a running P2P layer. Created by `P2pNode::start()`. The P2P layer 
 - `send_to` and `broadcast_outbound` never block on delivery — they queue and return.
 - The event subscriber is a read-only tap. It does not affect routing behavior.
 - Messages sent via `send_to` bypass the router — they go directly to the peer's write channel. The router does not see them and does not track them.
+- The event loop never blocks on validation — `Action::Validate` dispatch is non-blocking.
