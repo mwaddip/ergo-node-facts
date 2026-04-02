@@ -58,11 +58,15 @@ How the sync machine queries and updates chain state.
 
 ## HeaderSync
 
-### `HeaderSync::new(transport, chain, progress) -> Self`
+### `HeaderSync::new(config, transport, chain, store, progress, delivery) -> Self`
 - Create the sync state machine with injected dependencies.
+- `config`: `SyncConfig` with timing parameters (delivery timeout, sync intervals, etc.)
+- `store`: `SyncStore` for checking modifier existence
 - `progress`: `mpsc::Receiver<u32>` from the validation pipeline. Carries chain
   height after each validated batch. Used for stall detection and the two-batch
   SyncInfo pattern.
+- `delivery`: `mpsc::Receiver<DeliveryEvent>` from the pipeline. Carries received/evicted
+  modifier notifications and `NeedModifier` requests for 1-deep reorg support.
 
 ### `HeaderSync::run() -> !`
 - Long-running async task. Drives the sync loop until the runtime shuts down.
@@ -98,6 +102,20 @@ pick_sync_peer() → sync_from_peer() → synced()
 On stall: add current peer, pick next outbound peer not in set.
 On progress: clear the set (all peers eligible again).
 If all peers stalled: clear set, retry.
+
+### Multi-peer switching
+
+When any peer's SyncInfo shows a chain tip more than 1 block ahead of ours,
+the sync machine switches to syncing from that peer (`BehindPeer` event).
+The "caught up" check only triggers from the current sync peer — other peers
+reporting lower tips don't cause a false synced state.
+
+### 1-deep reorg support
+
+When the pipeline detects a fork (header at `tip+1` whose parent doesn't match
+our tip), it sends `DeliveryEvent::NeedModifier` to the sync machine. The sync
+machine requests the alternative block by modifier ID. When it arrives, the
+pipeline calls `HeaderChain::try_reorg` to replace the tip and continue chaining.
 
 ### Two-batch pattern
 
