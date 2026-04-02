@@ -112,6 +112,17 @@ Two wire formats exist. V2 is used by all current nodes (>= 4.0.16).
 - The chain never contains two headers at the same height on the same fork.
 - All timestamps are treated as untrusted data. Timing logic uses block height.
 
+## Block Section IDs
+
+### `section_ids(header: &Header) -> [(u8, [u8; 32]); 3]`
+- **Precondition**: Header is parsed.
+- **Postcondition**: Returns the modifier IDs for the three non-header block sections:
+  - `(102, Blake2b256(102 || header.id || header.transaction_root))` — BlockTransactions
+  - `(104, Blake2b256(104 || header.id || header.ad_proofs_root))` — ADProofs
+  - `(108, Blake2b256(108 || header.id || header.extension_root))` — Extension
+- **Pure computation**. No I/O, no state.
+- Matches JVM `NonHeaderBlockSection.computeId(typeId, headerId, digest)`.
+
 ## Does NOT own
 
 - Block bodies, transactions, AD proofs — that's `ergo-validation`.

@@ -26,6 +26,15 @@ How the sync machine sends messages and observes the network.
 #### `next_event() -> Option<ProtocolEvent>`
 - Receive the next incoming protocol event. Returns None if the stream ends.
 
+### `SyncStore`
+
+How the sync machine queries persistent storage.
+
+#### `has_modifier(type_id, id) -> bool`
+- Returns true if the modifier exists in the store.
+- Used to determine which block sections need downloading.
+- Must not block the async runtime (the bridge impl handles this).
+
 ### `SyncChain`
 
 How the sync machine queries and updates chain state.
@@ -109,19 +118,54 @@ Critical findings from debugging sync against JVM 6.0.3 peers:
 - **Single peer per cycle**: the JVM syncs from one Older peer per 20-second cycle, not all peers simultaneously.
 - **SyncInfo response**: the JVM responds to incoming SyncInfo with its own SyncInfo when `syncSendNeeded` (status changed, peer outdated, status=Older/Fork). We don't respond during active sync to avoid sending stale chain state.
 
+## Block Section Download
+
+After header sync reaches the peer's tip, the sync machine downloads block bodies
+(BlockTransactions, ADProofs, Extension) for stored headers.
+
+### Download queue
+
+The sync machine maintains an internal queue of `(type_id, modifier_id)` pairs
+for block sections that need downloading. The queue is populated from two sources:
+
+1. **On header progress**: when the pipeline reports new chained headers, compute
+   section IDs for each new header (via `chain::section_ids`), check the store
+   (`SyncStore::has_modifier`), and enqueue any missing sections.
+
+2. **On startup**: walk stored headers from height 1 to tip, compute section IDs,
+   check the store, enqueue what's missing. One-time startup cost.
+
+### Download cycle
+
+Block section requests follow the same pattern as header requests:
+- Send `ModifierRequest` with the section type and IDs
+- Track delivery via the `DeliveryTracker`
+- On timeout: re-request from a different peer
+- On receive: the pipeline stores the bytes (no validation)
+
+### Inv handling
+
+The JVM may send Inv with non-header type IDs (102, 104, 108). The sync machine
+should react to these the same way as header Inv: request the listed modifiers
+and track delivery.
+
+### Prioritization
+
+Header sync takes priority. Block section download starts only after header sync
+reaches the `Synced` state. During active header sync, block section requests
+are paused to avoid saturating the peer's bandwidth.
+
 ## Does NOT own
 
 - Header validation — that's `enr-chain` via the validation pipeline
+- Block section validation — that's `ergo-validation` (future)
 - Persistent storage — that's `store/`
 - Network I/O — that's `enr-p2p`
-- Modifier delivery tracking — future extension (specced, not implemented)
-- Block body sync — future extension
+- Section ID computation — that's `enr-chain` (`section_ids()`)
 - Fork choice / reorg handling — future extension
 
 ## Future Extensions
 
-- **Delivery tracker**: 10-second timeout, re-request from different peer, modifier state machine (Unknown → Requested → Received). Specced in `docs/superpowers/specs/2026-04-01-delivery-tracker-design.md`.
-- Block body download (type 102, 104, 108) after headers
 - UTXO state management coordination
 - Multiple sync modes (full / digest / UTXO snapshot)
 - Parallel header download from multiple peers
