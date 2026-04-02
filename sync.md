@@ -35,12 +35,23 @@ How the sync machine queries persistent storage.
 - Used to determine which block sections need downloading.
 - Must not block the async runtime (the bridge impl handles this).
 
+#### `put_height(type_id, id, height)`
+- Pre-register the height for a modifier ID before its data arrives.
+- Called when queuing block sections — the sync machine knows the height
+  (from the header), the pipeline does not.
+- The pipeline stores section bytes with height=0. The store skips the height
+  index write for height=0, preserving the pre-registered value.
+
 ### `SyncChain`
 
 How the sync machine queries and updates chain state.
 
 #### `chain_height() -> u32`
 - Height of the validated chain tip.
+
+#### `header_at(height: u32) -> Option<Header>`
+- Return the header at a given height, if it exists in the chain.
+- Used by the sync machine to compute block section IDs for download.
 
 #### `build_sync_info() -> Vec<u8>`
 - Build a V2 SyncInfo body from current chain state.
