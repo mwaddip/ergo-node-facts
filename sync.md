@@ -35,13 +35,6 @@ How the sync machine queries persistent storage.
 - Used to determine which block sections need downloading.
 - Must not block the async runtime (the bridge impl handles this).
 
-#### `put_height(type_id, id, height)`
-- Pre-register the height for a modifier ID before its data arrives.
-- Called when queuing block sections — the sync machine knows the height
-  (from the header), the pipeline does not.
-- The pipeline stores section bytes with height=0. The store skips the height
-  index write for height=0, preserving the pre-registered value.
-
 ### `SyncChain`
 
 How the sync machine queries and updates chain state.
