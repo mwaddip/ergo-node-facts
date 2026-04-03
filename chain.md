@@ -112,16 +112,38 @@ Two wire formats exist. V2 is used by all current nodes (>= 4.0.16).
 - The chain never contains two headers at the same height on the same fork.
 - All timestamps are treated as untrusted data. Timing logic uses block height.
 
+## State Type
+
+### `StateType` enum
+- `Utxo` — maintain the full UTXO set, validate transactions by direct input lookup.
+  Does not need AD proofs.
+- `Digest` — maintain only the AVL+ tree root hash, validate state transitions via
+  authenticated dictionary proofs (AD proofs). Requires downloading AD proofs from peers.
+
+Mirrors JVM's `StateType` enum. Determines which block sections are required for
+download and validation.
+
+### `StateType::requires_proofs() -> bool`
+- Returns `true` for `Digest`, `false` for `Utxo`.
+- Mirrors JVM's `stateType.requireProofs`.
+
 ## Block Section IDs
 
 ### `section_ids(header: &Header) -> [(u8, [u8; 32]); 3]`
 - **Precondition**: Header is parsed.
-- **Postcondition**: Returns the modifier IDs for the three non-header block sections:
+- **Postcondition**: Returns the modifier IDs for all three non-header block sections:
   - `(102, Blake2b256(102 || header.id || header.transaction_root))` — BlockTransactions
   - `(104, Blake2b256(104 || header.id || header.ad_proofs_root))` — ADProofs
   - `(108, Blake2b256(108 || header.id || header.extension_root))` — Extension
 - **Pure computation**. No I/O, no state.
-- Matches JVM `NonHeaderBlockSection.computeId(typeId, headerId, digest)`.
+- Matches JVM `Header.sectionIds`.
+
+### `required_section_ids(header: &Header, state_type: StateType) -> Vec<(u8, [u8; 32])>`
+- **Precondition**: Header is parsed.
+- **Postcondition**: Returns modifier IDs for sections required by the given state type:
+  - `Utxo` → BlockTransactions + Extension (2 entries). Matches JVM `Header.sectionIdsWithNoProof`.
+  - `Digest` → all three including ADProofs (3 entries). Matches JVM `Header.sectionIds`.
+- Mirrors JVM's `ToDownloadProcessor.requiredModifiersForHeader`.
 
 ## Does NOT own
 

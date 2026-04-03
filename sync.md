@@ -60,7 +60,9 @@ How the sync machine queries and updates chain state.
 
 ### `HeaderSync::new(config, transport, chain, store, progress, delivery) -> Self`
 - Create the sync state machine with injected dependencies.
-- `config`: `SyncConfig` with timing parameters (delivery timeout, sync intervals, etc.)
+- `config`: `SyncConfig` with timing parameters, delivery settings, and `state_type`.
+  The `state_type` field (`StateType::Utxo` or `StateType::Digest`) determines which
+  block sections are queued for download via `required_section_ids`.
 - `store`: `SyncStore` for checking modifier existence
 - `progress`: `mpsc::Receiver<u32>` from the validation pipeline. Carries chain
   height after each validated batch. Used for stall detection and the two-batch
@@ -142,8 +144,13 @@ Critical findings from debugging sync against JVM 6.0.3 peers:
 
 ## Block Section Download
 
-After header sync reaches the peer's tip, the sync machine downloads block bodies
-(BlockTransactions, ADProofs, Extension) for stored headers.
+After header sync reaches the peer's tip, the sync machine downloads block sections
+for stored headers. Which sections are downloaded depends on `SyncConfig.state_type`:
+- **UTXO mode**: BlockTransactions (102) + Extension (108). No AD proofs.
+- **Digest mode**: all three including ADProofs (104).
+
+This mirrors the JVM's `ToDownloadProcessor.requiredModifiersForHeader`, which calls
+`Header.sectionIdsWithNoProof` in UTXO mode and `Header.sectionIds` in digest mode.
 
 ### Download queue
 
@@ -151,8 +158,9 @@ The sync machine maintains an internal queue of `(type_id, modifier_id)` pairs
 for block sections that need downloading. The queue is populated from two sources:
 
 1. **On header progress**: when the pipeline reports new chained headers, compute
-   section IDs for each new header (via `chain::section_ids`), check the store
-   (`SyncStore::has_modifier`), and enqueue any missing sections.
+   section IDs for each new header (via `chain::required_section_ids` with the
+   configured state type), check the store (`SyncStore::has_modifier`), and
+   enqueue any missing sections.
 
 2. **On startup**: walk stored headers from height 1 to tip, compute section IDs,
    check the store, enqueue what's missing. One-time startup cost.
@@ -177,19 +185,51 @@ Header sync takes priority. Block section download starts only after header sync
 reaches the `Synced` state. During active header sync, block section requests
 are paused to avoid saturating the peer's bandwidth.
 
+## Block Assembly (full_block_height)
+
+The sync machine tracks a `full_block_height` watermark — the highest height where
+all required block sections are present in the store. This is the Rust equivalent
+of the JVM's `fullHeight`.
+
+### Watermark scanner
+
+`advance_full_block_height()` scans forward from the current watermark. For each
+height, it computes `required_section_ids(header, state_type)` and checks the
+store for each. Advances as far as possible, stops at the first gap.
+
+### Trigger points
+
+1. **Startup**: after the section queue is built from stored headers.
+2. **DeliveryEvent::Received**: after sections are stored by the pipeline.
+3. **Delivery check timer**: every 5 seconds during active sync. This is the
+   primary trigger — the delivery event channel can overflow when sections arrive
+   faster than the sync machine processes events, so the timer ensures the
+   scanner runs regardless.
+4. **Synced ticker**: every 30 seconds during the synced polling loop.
+
+### Invariants
+
+- `full_block_height <= chain_height` (can't have full blocks beyond the header chain)
+- Monotonically increasing (never decreases)
+- Heights at or below `full_block_height` have all sections required by the
+  current state type present in the store
+- The watermark becomes the trigger for transaction validation (Phase 4):
+  blocks between `last_validated_height` and `full_block_height` are ready
+
 ## Does NOT own
 
 - Header validation — that's `enr-chain` via the validation pipeline
 - Block section validation — that's `ergo-validation` (future)
 - Persistent storage — that's `store/`
 - Network I/O — that's `enr-p2p`
-- Section ID computation — that's `enr-chain` (`section_ids()`)
+- Section ID computation — that's `enr-chain` (`section_ids()` / `required_section_ids()`)
 - Fork choice / reorg handling — future extension
 
 ## Future Extensions
 
 - UTXO state management coordination
-- Multiple sync modes (full / digest / UTXO snapshot)
+- Digest mode (set `state_type = "digest"` — plumbing is in place, ADProofs will
+  be downloaded automatically)
 - Parallel header download from multiple peers
 - Fork detection and chain reorganization
 - Turbo sync mode (adaptive batch sizes, see IDEAS.md)
