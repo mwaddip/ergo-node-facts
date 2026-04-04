@@ -58,28 +58,38 @@ How the sync machine queries and updates chain state.
 
 ## HeaderSync
 
-### `HeaderSync::new(config, transport, chain, store, progress, delivery) -> Self`
+### `HeaderSync::new(config, transport, chain, store, validator, progress, delivery_control, delivery_data) -> Self`
 - Create the sync state machine with injected dependencies.
 - `config`: `SyncConfig` with timing parameters, delivery settings, and `state_type`.
   The `state_type` field (`StateType::Utxo` or `StateType::Digest`) determines which
   block sections are queued for download via `required_section_ids`.
 - `store`: `SyncStore` for checking modifier existence
+- `validator`: `BlockValidator` for digest/UTXO-mode block validation
 - `progress`: `mpsc::Receiver<u32>` from the validation pipeline. Carries chain
   height after each validated batch. Used for stall detection and the two-batch
   SyncInfo pattern.
-- `delivery`: `mpsc::Receiver<DeliveryEvent>` from the pipeline. Carries received/evicted
-  modifier notifications and `NeedModifier` requests for 1-deep reorg support.
+- `delivery_control`: `mpsc::UnboundedReceiver<DeliveryControl>` from the pipeline.
+  Carries `Reorg` and `NeedModifier` events. These are rare and critical — losing
+  one is unrecoverable. Unbounded channel, never dropped.
+- `delivery_data`: `mpsc::Receiver<DeliveryData>` from the pipeline. Carries
+  `Received` and `Evicted` modifier notifications. High-volume, lossy — missing
+  one just delays the watermark scan by one timer tick. Bounded channel (capacity 64),
+  sent via `try_send`.
 
 ### `HeaderSync::run() -> !`
 - Long-running async task. Drives the sync loop until the runtime shuts down.
 
 ## Architecture: Event-driven loop
 
-Three event sources via `tokio::select!`:
+Four event sources via `tokio::select!` with `biased;` (control checked first):
 
-1. **P2P events** — Inv (header IDs from peer), SyncInfo (peer's chain state), peer disconnect
-2. **Pipeline progress** — `mpsc::Receiver<u32>` carrying chain height after each validated batch
-3. **Sync timer** — fires every 20 seconds (matching JVM's `MinSyncInterval`)
+1. **Control-plane events** — `DeliveryControl::Reorg` and `DeliveryControl::NeedModifier`
+   from the pipeline. Checked with priority via `biased;` — these are never dropped.
+2. **P2P events** — Inv (header IDs from peer), SyncInfo (peer's chain state), peer disconnect
+3. **Data-plane events** — `DeliveryData::Received` and `DeliveryData::Evicted` from the
+   pipeline. Lossy — the delivery timer provides fallback scanning.
+4. **Pipeline progress** — `mpsc::Receiver<u32>` carrying chain height after each validated batch
+5. **Sync timer** — fires every 20 seconds (matching JVM's `MinSyncInterval`)
 
 ## Sync cycle
 
@@ -112,12 +122,25 @@ the sync machine switches to syncing from that peer (`BehindPeer` event).
 The "caught up" check only triggers from the current sync peer — other peers
 reporting lower tips don't cause a false synced state.
 
-### 1-deep reorg support
+### Deep reorg support
 
-When the pipeline detects a fork (header at `tip+1` whose parent doesn't match
-our tip), it sends `DeliveryEvent::NeedModifier` to the sync machine. The sync
-machine requests the alternative block by modifier ID. When it arrives, the
-pipeline calls `HeaderChain::try_reorg` to replace the tip and continue chaining.
+The pipeline handles fork detection and chain reorganization. When a fork header
+arrives that creates a better chain (higher cumulative difficulty), the pipeline:
+
+1. Stores the fork header with its score via the store's fork-aware tables.
+2. Assembles the fork branch by walking parent links backward through the store.
+3. Executes `HeaderChain::try_reorg_deep()` to atomically swap the best chain.
+4. Sends `DeliveryControl::Reorg { fork_point, old_tip, new_tip }` to the sync machine.
+
+The sync machine responds by clearing its section queue, resetting both watermarks
+(`downloaded_height` and `validated_height`) to the fork point, resetting the
+block validator's state root, re-queuing sections for the new branch, and
+re-scanning the download watermark.
+
+For incomplete fork chains (parent not in store), the pipeline sends
+`DeliveryControl::NeedModifier` to request the missing parent header. Once it
+arrives, the fork chain links backward and triggers the reorg if the score is
+sufficient. See `facts/reorg.md` for the full contract.
 
 ### Two-batch pattern
 
@@ -129,7 +152,8 @@ SyncInfo is allowed per cycle.
 ### Synced state
 
 Periodic SyncInfo (30s) to detect new blocks. Reacts to Inv with ModifierRequest.
-Receives pipeline progress for logging.
+Receives pipeline progress for logging. The control channel is checked with
+`biased;` priority in the synced loop too — a `Reorg` while synced must not be missed.
 
 ## JVM peer behavior (observed)
 
@@ -185,51 +209,51 @@ Header sync takes priority. Block section download starts only after header sync
 reaches the `Synced` state. During active header sync, block section requests
 are paused to avoid saturating the peer's bandwidth.
 
-## Block Assembly (full_block_height)
+## Block Assembly (downloaded_height / validated_height)
 
-The sync machine tracks a `full_block_height` watermark — the highest height where
-all required block sections are present in the store. This is the Rust equivalent
-of the JVM's `fullHeight`.
+The sync machine tracks two watermarks:
+
+- **`downloaded_height`** — the highest height where all required block sections
+  are present in the store. Blocks at or below this height are ready for validation.
+- **`validated_height`** — the highest height where block sections have been
+  validated by the `BlockValidator`. Always `<= downloaded_height`.
+
+Both are initialized from `validator.validated_height()` on startup.
 
 ### Watermark scanner
 
-`advance_full_block_height()` scans forward from the current watermark. For each
+`advance_downloaded_height()` scans forward from the current watermark. For each
 height, it computes `required_section_ids(header, state_type)` and checks the
-store for each. Advances as far as possible, stops at the first gap.
+store for each. Advances as far as possible, stops at the first gap. On advance,
+calls `advance_validated_height()` to run the block validator on newly downloaded blocks.
 
 ### Trigger points
 
 1. **Startup**: after the section queue is built from stored headers.
-2. **DeliveryEvent::Received**: after sections are stored by the pipeline.
+2. **DeliveryData::Received**: after sections are stored by the pipeline.
 3. **Delivery check timer**: every 5 seconds during active sync. This is the
-   primary trigger — the delivery event channel can overflow when sections arrive
+   primary trigger — the data channel can overflow when sections arrive
    faster than the sync machine processes events, so the timer ensures the
    scanner runs regardless.
 4. **Synced ticker**: every 30 seconds during the synced polling loop.
 
 ### Invariants
 
-- `full_block_height <= chain_height` (can't have full blocks beyond the header chain)
-- Monotonically increasing (never decreases)
-- Heights at or below `full_block_height` have all sections required by the
-  current state type present in the store
-- The watermark becomes the trigger for transaction validation (Phase 4):
-  blocks between `last_validated_height` and `full_block_height` are ready
+- `validated_height <= downloaded_height <= chain_height`
+- `validated_height` is monotonically increasing (except on reorg reset)
+- Heights at or below `validated_height` have verified state transitions
 
 ## Does NOT own
 
 - Header validation — that's `enr-chain` via the validation pipeline
-- Block section validation — that's `ergo-validation` (future)
+- Block section validation — that's `ergo-validation` via `BlockValidator` trait
 - Persistent storage — that's `store/`
 - Network I/O — that's `enr-p2p`
 - Section ID computation — that's `enr-chain` (`section_ids()` / `required_section_ids()`)
-- Fork choice / reorg handling — future extension
+- Fork choice / reorg execution — that's the pipeline (via `HeaderChain::try_reorg_deep`)
 
 ## Future Extensions
 
 - UTXO state management coordination
-- Digest mode (set `state_type = "digest"` — plumbing is in place, ADProofs will
-  be downloaded automatically)
 - Parallel header download from multiple peers
-- Fork detection and chain reorganization
 - Turbo sync mode (adaptive batch sizes, see IDEAS.md)

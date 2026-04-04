@@ -312,11 +312,11 @@ chain's blocks.
 
 **Two modes:**
 
-1. **Catching up** (`full_block_height` far from `chain_height`): request
+1. **Catching up** (`downloaded_height` far from `chain_height`): request
    sections for best-chain headers only. "Far" = more than 128 blocks behind
    the chain tip. This matches the JVM's `farAwayFromBeingSynced` threshold.
 
-2. **Near tip** (`full_block_height` within 128 of `chain_height`): request
+2. **Near tip** (`downloaded_height` within 128 of `chain_height`): request
    sections for ALL headers at each height — best chain and forks. Scan
    backward from the best full block by up to 100 heights, requesting
    sections for every header ID at each height (via `store.header_ids_at_height`).
@@ -346,34 +346,45 @@ When a reorg demotes heights H₁..Hₙ:
 
 3. **Adjust `sections_queued_to`** if it was within the reorged range.
 
-#### `full_block_height` watermark on reorg
+#### Watermarks on reorg
 
-If `full_block_height >= fork_point_height`:
+If `downloaded_height >= fork_point_height`:
 
-1. **Reset** `full_block_height` to `fork_point_height`. Block sections for the
+1. **Reset** `downloaded_height` to `fork_point_height`. Block sections for the
    old branch above the fork point are invalid for the new branch — they have
    different modifier IDs (derived from different header IDs).
 
 2. **Re-scan** from `fork_point_height + 1` forward. Some sections might already
    be in the store if fork sections were pre-fetched.
 
-If `full_block_height < fork_point_height`: no change needed. The watermark
-hasn't reached the reorged range yet.
+If `downloaded_height < fork_point_height`: no change needed.
+
+If `validated_height >= fork_point_height`:
+
+1. **Get** the header at the fork point from the chain.
+2. **Call** `validator.reset_to(fork_point, header.state_root)`.
+3. **Set** `validated_height` to `fork_point_height`.
+
+The validator will re-validate from `fork_point + 1` as sections become available.
 
 #### Reorg notification
 
-The pipeline notifies the sync machine of a reorg via a new `DeliveryEvent` variant:
+The pipeline notifies the sync machine of a reorg via the control channel:
 
 ```rust
-DeliveryEvent::Reorg {
+DeliveryControl::Reorg {
     fork_point: u32,
     old_tip: u32,
     new_tip: u32,
 }
 ```
 
-The sync machine handles this by adjusting its section queue, watermark, and
-download mode as described above.
+Sent via unbounded `mpsc::UnboundedSender` — Reorg events must never be dropped.
+The sync machine checks the control channel with `biased;` priority in every
+`tokio::select!` loop (both `sync_from_peer()` and `synced()`). It handles the
+event by adjusting its section queue, watermarks (both `downloaded_height` and
+`validated_height`), resetting the block validator, and re-downloading sections
+for the new branch.
 
 ---
 
