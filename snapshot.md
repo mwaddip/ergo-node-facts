@@ -348,7 +348,12 @@ This is display-only — no correctness dependency on the progress channel.
 
 ## Serving: Snapshot Creation and Responses
 
-Lower priority. Requires a synced UTXO node.
+**Status: Implemented** (pending state submodule `dump_snapshot()` integration).
+
+Storage: `src/snapshot_store.rs` (`snapshots.redb`, redb 4).
+Request handlers: `src/snapshot_serve.rs` (codes 76/78/80).
+Creation trigger: `src/main.rs` (polls every 30s, fires at `height % interval == interval - 1`).
+Prompt for state submodule: `prompts/state-dump-snapshot.md`.
 
 ### Snapshot creation
 
