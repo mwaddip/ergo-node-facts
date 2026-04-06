@@ -166,6 +166,20 @@ default                           S8  P9  E6  C8  I6  A6  L5
   External-facing. Input validation is the primary concern. Must not leak
   internal state or enable DoS via expensive queries. Clarity matters —
   developers stare at this API. Not a long-running critical process.
+
+```
+
+### Workspace crate: `ergo-mining`
+
+Block candidate assembly, emission/fee transaction construction, PoW
+solution validation. The logic behind the mining API endpoints.
+
+```
+default                           S9  P9  E6  C7  I8  A7  L9
+  Consensus-critical assembly. A malformed candidate wastes miner hashpower;
+  a malformed block gets rejected by peers. Coordinates many components —
+  wrong boundaries mean tangled code. Epoch boundary voting, emission box
+  transitions, empty mempool, max-cost blocks are the edge cases.
 ```
 
 ### Main crate: `ergo-node-rust`
