@@ -475,6 +475,28 @@ peers between blocks:
 These are checked in `process()` before validation. Locally submitted
 transactions (source = None) bypass rate limiting.
 
+## P2P Transaction Broadcast (main crate responsibility)
+
+The mempool crate does not broadcast transactions. The main crate's mempool
+task handles broadcast after `process()` returns:
+
+**On acceptance (Accepted or Replaced):**
+- Build `Inv { modifier_type: 2, ids: [tx_id] }` message
+- `broadcast_outbound()` to all connected outbound peers
+- For P2P-sourced transactions, this relays to peers that haven't seen it
+- For API-sourced transactions, this announces the new tx to the network
+
+**On cleanup (rebroadcast):**
+- `select_for_rebroadcast()` returns up to `rebroadcast_count` transactions
+  whose inputs still exist in the confirmed UTXO set
+- Build `Inv { modifier_type: 2, ids: [tx_ids...] }` message
+- `broadcast_outbound()` to all connected outbound peers
+- Peers that already have the tx in their pool will ignore the Inv
+
+**Not broadcast:**
+- Declined, Invalidated, DoubleSpendLoser, AlreadyInPool outcomes
+- Transactions removed by `apply_block()` or `revalidate()`
+
 ## Configuration
 
 ```toml
