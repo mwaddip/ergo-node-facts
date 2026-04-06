@@ -21,7 +21,7 @@
 ## Module: `transport::handshake`
 
 ### `build(config) -> Vec<u8>`
-- **Postcondition**: Raw handshake bytes containing: VLQ timestamp, agent name, version (3 bytes), peer name, declared address, Mode feature, Session feature. Feature body lengths encoded as u16 big-endian.
+- **Postcondition**: Raw handshake bytes containing: VLQ timestamp, agent name, version (3 bytes), peer name, declared address, Mode feature, Session feature. Feature body lengths encoded as VLQ.
 
 ### `parse(data) -> Result<PeerSpec>`
 - **Precondition**: Valid Ergo handshake payload.
