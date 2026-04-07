@@ -323,6 +323,32 @@ and `NipopowAlgos.scala`.
   chain has fewer than k blocks.
 - **Determinism**: For any two correct implementations on the same chain,
   the output is byte-identical.
+- **Genesis (height 1) special case**: The genesis block's interlinks vector
+  is canonical and MUST NOT be read from the extension loader. The
+  implementation MUST detect h=1 and synthesize the genesis `PoPowHeader`
+  directly, with:
+  - `interlinks = [genesis_block_id]` (per JVM
+    `NipopowAlgos.updateInterlinks(genesis, Seq.empty)` and
+    `PoPowHeader.checkInterlinksProof` semantics for the genesis row).
+  - `interlinks_proof` = the canonical interlinks merkle proof for the
+    genesis row, matching the JVM's `NipopowAlgos` output. The
+    implementation should reuse `ergo_nipopow` helpers rather than handcraft
+    bytes — the goal is byte-identical equivalence with the JVM proof
+    serializer for chains starting at genesis.
+
+  **Rationale**: testnet and mainnet genesis extensions have `fields = []`
+  and `extensionHash = 0e5751c0...` (the empty merkle root) — verified via
+  JVM `/blocks/{genesis_id}/extension`. Loading and unpacking the empty
+  extension produces empty interlinks `[]`, which is wrong by convention
+  and produces a malformed proof. The fix lives in `build_nipopow_proof`,
+  not in the loader: the loader is supposed to load real extension bytes,
+  not synthesize a special-case payload.
+
+  **Verified by**: integration test `tests/nipopow_serve_integration.rs`
+  in the main crate, which sends `GetNipopowProof(m=6, k=6)` to a running
+  node and verifies the response round-trips through
+  `verify_nipopow_proof_bytes`. Pre-fix this fails with
+  `extension at height 1 missing from loader`.
 
 ### `verify_nipopow_proof_bytes(bytes: &[u8]) -> Result<NipopowProofMeta>`
 - **Precondition**: `bytes` is the inner NiPoPoW proof payload (the main
@@ -364,6 +390,10 @@ future) compare against local chain state.
   consensus-critical.
 - Building never produces a proof that would fail verification on the same
   implementation.
+- For chains rooted at genesis (any proof whose walk includes h=1), the
+  implementation MUST NOT call the extension loader for h=1 — the genesis
+  `PoPowHeader` is synthesized in-process per the rules above. The loader
+  remains the source of truth for h ≥ 2.
 
 ## Does NOT own
 
