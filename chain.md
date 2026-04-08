@@ -309,46 +309,80 @@ JVM reference: `ergo-core/src/main/scala/org/ergoplatform/modifiers/history/popo
 and `NipopowAlgos.scala`.
 
 ### `build_nipopow_proof(m: u32, k: u32, header_id: Option<HeaderId>) -> Result<Vec<u8>>`
-- **Precondition**: Chain is non-empty. `header_id`, if provided, must be in
-  the chain (proof is built from the chain ending at that header). If `None`,
-  the proof is built from the current tip.
+- **Precondition**: Chain is non-empty and contains at least `m + k`
+  headers. `header_id`, if provided, must be in the chain (proof is built
+  from the chain ending at that header). If `None`, the proof is built
+  from the current tip.
 - **Postcondition**: Returns the inner serialized NiPoPoW proof bytes (no P2P
   envelope wrapping). The bytes are exactly what JVM's
   `NipopowProofSerializer.toBytes(proof)` produces — the main crate prepends
   the message envelope when sending.
-- **Algorithm**: Use `ergo_nipopow::NipopowAlgos::prove` (or equivalent) on
-  the chain's `PoPowHeader` sequence, with security parameters m (min
-  μ-level superchain length) and k (min suffix length, ≥ 1).
-- **Cost**: Walks the full chain. Cap m + k at sane values. Reject if the
-  chain has fewer than k blocks.
+- **Algorithm**: Use `ergo_nipopow::NipopowAlgos::prove_with_reader` against
+  a `PopowHeaderReader` implementation over the local chain. The reader
+  walks the interlink hierarchy on demand and fetches only the popow
+  headers the algorithm actually needs: genesis, the suffix, and the
+  superlevel chains back from the suffix head. Do NOT materialize the
+  full chain as `Vec<PoPowHeader>` and hand it to the in-memory
+  `NipopowAlgos::prove` — that is the test-helper variant (port of JVM
+  `NipopowAlgos.prove(Seq[PoPowHeader])`), not the production variant.
+  JVM production serving uses `NipopowProverWithDbAlgs.prove`;
+  `prove_with_reader` is the Rust port of that function. Security
+  parameters m (min μ-level superchain length) and k (min suffix length,
+  ≥ 1) pass through unchanged.
+- **Cost**: `O(m + k + m · log₂ N)` popow header fetches per call, where
+  N is the chain length. For `m=6, k=10` at `N=270k` this is ≈ 120
+  fetches, not 270 000. Cap m + k at sane values. Reject if the chain
+  has fewer than `m + k` headers.
 - **Determinism**: For any two correct implementations on the same chain,
-  the output is byte-identical.
-- **Genesis (height 1) special case**: The genesis block's interlinks vector
-  is canonical and MUST NOT be read from the extension loader. The
-  implementation MUST detect h=1 and synthesize the genesis `PoPowHeader`
-  directly, with:
+  the output is byte-identical. `prove_with_reader` and the in-memory
+  `prove` produce equivalent proofs for the same `(m, k)` on the same
+  underlying history — sigma-rust's `ergo-chain-generation` test suite
+  asserts byte-for-byte equivalence.
+- **Non-scope**: JVM's `continuous = true` mode (which interleaves
+  difficulty-recalculation-boundary headers into the prefix so that
+  light clients can self-validate difficulty for blocks after the
+  suffix) is NOT supported. sigma-rust's `NipopowProof` struct has no
+  `continuous` field — adding it requires a separate change to the
+  struct, serializer, and on-wire format. `build_nipopow_proof`
+  produces non-continuous proofs. JVM peers applying non-continuous
+  proofs still succeed (`applyPopowProof` doesn't strictly require the
+  flag); they just can't self-validate post-suffix difficulty until
+  they sync more headers. This is fine for P2P serve. Tracked as
+  follow-up in the roadmap.
+- **Genesis (height 1) special case**: The genesis block's interlinks
+  vector is canonical and MUST NOT be read from the extension loader. The
+  **reader implementation** (not `build_nipopow_proof` directly) is
+  responsible for detecting `height == 1` and synthesizing the genesis
+  `PoPowHeader` in-process, with:
   - `interlinks = [genesis_block_id]` (per JVM
     `NipopowAlgos.updateInterlinks(genesis, Seq.empty)` and
     `PoPowHeader.checkInterlinksProof` semantics for the genesis row).
   - `interlinks_proof` = the canonical interlinks merkle proof for the
-    genesis row, matching the JVM's `NipopowAlgos` output. The
-    implementation should reuse `ergo_nipopow` helpers rather than handcraft
-    bytes — the goal is byte-identical equivalence with the JVM proof
-    serializer for chains starting at genesis.
+    genesis row, matching the JVM's `NipopowAlgos` output. The reader
+    should reuse `ergo_nipopow` helpers (`pack_interlinks` +
+    `proof_for_interlink_vector` over a synthetic `ExtensionCandidate`)
+    rather than handcraft bytes — the goal is byte-identical equivalence
+    with the JVM proof serializer for chains starting at genesis.
 
   **Rationale**: testnet and mainnet genesis extensions have `fields = []`
   and `extensionHash = 0e5751c0...` (the empty merkle root) — verified via
   JVM `/blocks/{genesis_id}/extension`. Loading and unpacking the empty
   extension produces empty interlinks `[]`, which is wrong by convention
-  and produces a malformed proof. The fix lives in `build_nipopow_proof`,
-  not in the loader: the loader is supposed to load real extension bytes,
-  not synthesize a special-case payload.
+  and produces a malformed proof. The fix belongs in the reader: the
+  extension loader is supposed to load real extension bytes, not
+  synthesize a special-case payload. The reader's
+  `popow_header_at_height(1)` (and `popow_header_by_id(genesis_id)`)
+  paths both synthesize; every other height path goes through the
+  loader as normal.
 
   **Verified by**: integration test `tests/nipopow_serve_integration.rs`
   in the main crate, which sends `GetNipopowProof(m=6, k=6)` to a running
   node and verifies the response round-trips through
-  `verify_nipopow_proof_bytes`. Pre-fix this fails with
-  `extension at height 1 missing from loader`.
+  `verify_nipopow_proof_bytes`. The chain crate's
+  `build_proof_skips_loader_for_genesis` unit test fixtures a chain
+  whose loader has no entry for `h=1` and asserts the build still
+  succeeds — a black-box check that the reader's genesis synthesis path
+  is wired correctly.
 
 ### `verify_nipopow_proof_bytes(bytes: &[u8]) -> Result<NipopowProofMeta>`
 - **Precondition**: `bytes` is the inner NiPoPoW proof payload (the main
@@ -390,10 +424,14 @@ future) compare against local chain state.
   consensus-critical.
 - Building never produces a proof that would fail verification on the same
   implementation.
-- For chains rooted at genesis (any proof whose walk includes h=1), the
-  implementation MUST NOT call the extension loader for h=1 — the genesis
-  `PoPowHeader` is synthesized in-process per the rules above. The loader
-  remains the source of truth for h ≥ 2.
+- The `PopowHeaderReader` implementation used by `build_nipopow_proof`
+  MUST synthesize the genesis `PoPowHeader` in-process — the extension
+  loader MUST NOT be called for `height == 1` or for the genesis block
+  id. The loader remains the source of truth for `h ≥ 2`. This applies
+  to any reader variant (production chain, test fixture, future remote
+  reader); it is consensus-critical because real genesis extensions are
+  empty and cannot produce the canonical `interlinks = [genesis_id]`
+  vector via the loader path.
 
 ## Does NOT own
 
