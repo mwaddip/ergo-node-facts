@@ -92,10 +92,14 @@ pub trait ModifierStore: Send + Sync {
 
     // --- Fork-aware header storage ---
 
-    /// Store a header with its fork number and cumulative score.
+    /// Store a fork header with its fork number and cumulative score.
     /// Writes PRIMARY (101,id), HEADER_FORKS (height, fork), HEADER_SCORES.
     /// Writes BEST_CHAIN only if no entry exists at this height yet
-    /// (first-arrival wins until a reorg or a put_batch overwrite).
+    /// (first-arrival wins until a main-chain put_batch overwrite).
+    ///
+    /// Not used for main-chain headers — those go through put_batch,
+    /// which routes type_id=101 through the fork-aware tables with
+    /// an unconditional BEST_CHAIN insert.
     fn put_header(
         &self,
         id: &[u8; 32],
@@ -103,13 +107,6 @@ pub trait ModifierStore: Send + Sync {
         fork: u32,
         score: &[u8],
         data: &[u8],
-    ) -> Result<(), Self::Error>;
-
-    /// Batch version of put_header. Same semantics applied per entry.
-    fn put_header_batch(
-        &self,
-        entries: &[([u8; 32], u32, u32, Vec<u8>, Vec<u8>)],
-        // (id, height, fork, score, data)
     ) -> Result<(), Self::Error>;
 
     /// Get all header IDs at a given height across all known forks.
@@ -136,13 +133,6 @@ pub trait ModifierStore: Send + Sync {
 
     /// Get the best chain tip (highest height and header ID).
     fn best_header_tip(&self) -> Result<Option<(u32, [u8; 32])>, Self::Error>;
-
-    /// Atomically switch the best chain: remove old entries, insert new ones.
-    fn switch_best_chain(
-        &self,
-        demote: &[u32],
-        promote: &[(u32, [u8; 32])],
-    ) -> Result<(), Self::Error>;
 }
 ```
 
@@ -204,8 +194,6 @@ guarded by `header_forks.len() > 0` and runs until the guard trips.
   positive fork number, and `score` is the cumulative difficulty encoded as
   big-endian BigUint bytes.
 - **`get` / `get_id_at` / `contains` / `tip`**: No preconditions beyond valid type_id.
-- **`switch_best_chain`**: `demote` heights exist in BEST_CHAIN; `promote` entries
-  reference headers that already exist in PRIMARY + HEADER_FORKS.
 
 ## Postconditions
 
@@ -227,9 +215,6 @@ guarded by `header_forks.len() > 0` and runs until the guard trips.
 - **`contains`**: Equivalent to `get(..).map(|o| o.is_some())` but avoids reading data.
 - **`tip`**: Returns the highest `(height, id)` pair. For type 101 this is the
   best-chain tip.
-- **`switch_best_chain`**: Atomically removes the specified demoted heights and
-  inserts the promoted entries. Updates the best-header tip cache from
-  `promote.iter().max_by_key(height)` if non-empty.
 
 ## Invariants
 
@@ -260,12 +245,18 @@ guarded by `header_forks.len() > 0` and runs until the guard trips.
 - `redb` — storage backend (initial implementation)
 - No dependency on `ergo-chain-types`, `ergo-lib`, or any Ergo domain crates.
 
+## Reorg handling
+
+There is no dedicated "switch best chain" API. Deep reorgs are
+handled entirely through `put_batch`: after the caller has updated
+the in-memory chain to the new branch, it re-emits every new-branch
+header via `put_batch` with `type_id=101`, which unconditionally
+overwrites BEST_CHAIN at each height. This is the single write path
+for main-chain headers and keeps the invariant "main-chain is
+authoritative for its height slot" without a second atomic-swap API.
+
 ## Known follow-ups
 
-- `put_header_batch` and `switch_best_chain` currently have no production
-  callers outside of tests. They exist for a future deep-reorg integration
-  on the pipeline side that hasn't landed. Either the integration lands or
-  these methods are removed.
 - Non-header modifier `tip` uses an in-memory `HashMap<type_id, (height, id)>`
   cache separate from BEST_CHAIN. That cache is only updated by writes in
   the current process — a fresh open loads it from `HEIGHT_INDEX` via
