@@ -86,12 +86,18 @@ pub struct MinerConfig {
     pub miner_pk: ProveDlog,
     /// Miner reward delay in blocks (mainnet: 720, testnet: 720).
     /// Reward boxes are time-locked for this many blocks.
-    pub reward_delay: u32,
+    pub reward_delay: i32,
     /// Voting preferences: 3 bytes [soft_fork_vote, param_vote_1, param_vote_2].
     /// [0, 0, 0] = no votes.
     pub votes: [u8; 3],
     /// Maximum block candidate lifetime before forced regeneration.
     pub candidate_ttl: Duration,
+    /// EIP-27 re-emission rules. Carried in config (not derived inside
+    /// `generate_candidate`) so the network-policy decision lives at the
+    /// configuration boundary. Construct from the chain's network type at
+    /// config-load time. Currently hardcoded to mainnet at the call sites
+    /// in `src/main.rs` until testnet/devnet network detection is wired in.
+    pub reemission_rules: ReemissionRules,
 }
 ```
 
@@ -446,26 +452,40 @@ CandidateBlock {
 
 Convert the candidate into the data miners need.
 
-1. **Build HeaderWithoutPow:**
+1. **Build HeaderWithoutPow.** Field order, sizes and encoding must match
+   JVM `HeaderSerializer.serializeWithoutPow` exactly:
 
-   | Field | Size | Source |
-   |-------|------|--------|
-   | version | 1 byte | `candidate.version` |
-   | parentId | 32 bytes | `candidate.parent.id` |
-   | ADProofsRoot | 32 bytes | `Blake2b256(candidate.ad_proof_bytes)` |
-   | stateRoot | 33 bytes | `candidate.state_root` (32-byte hash + tree height) |
-   | transactionsRoot | 32 bytes | Merkle root of transaction IDs |
-   | timestamp | VLQ uint64 | `candidate.timestamp` |
-   | nBits | VLQ uint64 | `candidate.n_bits` |
-   | height | VLQ uint32 | `candidate.parent.height + 1` |
-   | extensionRoot | 32 bytes | `candidate.extension.digest()` |
-   | votes | 3 bytes | `candidate.votes` |
+   | # | Field | Size | Encoding | Source |
+   |---|-------|------|----------|--------|
+   | 1 | version | 1 byte | raw `u8` | `candidate.version` |
+   | 2 | parentId | 32 bytes | raw bytes | `candidate.parent.id` |
+   | 3 | ADProofsRoot | 32 bytes | raw bytes | `Blake2b256(candidate.ad_proof_bytes)` |
+   | 4 | transactionsRoot | 32 bytes | raw bytes | Merkle root of transaction IDs |
+   | 5 | stateRoot | 33 bytes | raw bytes (32-byte hash + 1-byte tree height) | `candidate.state_root` |
+   | 6 | timestamp | variable | VLQ `u64` | `candidate.timestamp` |
+   | 7 | extensionRoot | 32 bytes | raw bytes | `candidate.extension.digest()` |
+   | 8 | nBits | 4 bytes | fixed-width big-endian `u32` (NOT VLQ) | `candidate.n_bits` |
+   | 9 | height | variable | VLQ `u32` | `candidate.parent.height + 1` |
+   | 10 | votes | 3 bytes | raw bytes | `candidate.votes` |
+   | 11 | unparsedBytes (only if version > 1) | 1 byte length + N bytes | raw `u8` length prefix + raw bytes | empty for first release |
 
-   **Consensus-critical:** This serialization must match the JVM's
-   `HeaderSerializer.bytesWithoutPow()` byte-for-byte. Any divergence
-   means miners compute solutions for the wrong message and blocks are
-   rejected by the network. Verify field order, integer encoding, and
-   byte layout against the JVM source and via cross-node testing.
+   **Consensus-critical.** This serialization must match JVM
+   `HeaderSerializer.bytesWithoutPow` byte-for-byte. Any divergence means
+   miners compute solutions for the wrong message and blocks are rejected
+   by the network. The serializer itself is delegated to sigma-rust's
+   `Header::serialize_without_pow`, which is JVM-pinned upstream against
+   the height-614,400 mainnet header (see
+   `ergo-chain-types::autolykos_pow_scheme::tests::test_first_increase_in_big_n`).
+   The mining crate's responsibility is correctly mapping `CandidateBlock`
+   fields into the `Header` struct before handing it to the encoder; that
+   wiring is verified by `mining/tests/work_message_wiring.rs`.
+
+   **Note on `nBits`:** despite Scorex's general rule that integers are
+   VLQ-encoded, `nBits` is the one exception in the header — it's written
+   as 4 raw big-endian bytes via JVM `DifficultySerializer.serialize`, and
+   sigma-rust matches this with `n_bits.to_be_bytes()`. Earlier versions
+   of this contract incorrectly described `nBits` as VLQ; the code was
+   always correct.
 
 2. **Serialize** the header without PoW fields.
 
