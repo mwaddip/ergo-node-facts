@@ -333,11 +333,21 @@ and `NipopowAlgos.scala`.
   N is the chain length. For `m=6, k=10` at `N=270k` this is ≈ 120
   fetches, not 270 000. Cap m + k at sane values. Reject if the chain
   has fewer than `m + k` headers.
-- **Determinism**: For any two correct implementations on the same chain,
-  the output is byte-identical. `prove_with_reader` and the in-memory
-  `prove` produce equivalent proofs for the same `(m, k)` on the same
-  underlying history — sigma-rust's `ergo-chain-generation` test suite
-  asserts byte-for-byte equivalence.
+- **Determinism**: For a given `(m, k)` and chain state,
+  `build_nipopow_proof` produces byte-identical output to JVM
+  `NipopowProverWithDbAlgs.prove` on the same chain — `prove_with_reader`
+  is a direct port of that function. Note: the in-memory sigma-rust
+  `NipopowAlgos::prove(&[PoPowHeader])` variant (a port of the JVM test
+  helper `NipopowAlgos.prove(Seq[PoPowHeader])`) can produce a
+  different-but-also-valid proof on the same chain — its per-level scan
+  visits level-0 blocks at `level = 0` that the interlink walk never
+  traverses, because level-0 blocks never appear in interlink vectors.
+  sigma-rust's equivalence test between the two variants lives in
+  `ergo-chain-generation/src/fake_pow_scheme.rs` and uses a fake PoW
+  scheme that forces every block to `max_level ≥ 1` — the same approach
+  the JVM's `PoPowAlgosWithDBSpec` takes with `DefaultFakePowScheme`.
+  Use `prove_with_reader` for any production path; the in-memory
+  `prove` is only appropriate for test scenarios with synthetic chains.
 - **Non-scope**: JVM's `continuous = true` mode (which interleaves
   difficulty-recalculation-boundary headers into the prefix so that
   light clients can self-validate difficulty for blocks after the
