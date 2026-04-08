@@ -61,20 +61,29 @@ How the sync machine queries and updates chain state.
 ### `HeaderSync::new(config, transport, chain, store, validator, progress, delivery_control, delivery_data) -> Self`
 - Create the sync state machine with injected dependencies.
 - `config`: `SyncConfig` with timing parameters, delivery settings, and `state_type`.
-  The `state_type` field (`StateType::Utxo` or `StateType::Digest`) determines which
-  block sections are queued for download via `required_section_ids`.
+  The `state_type` field (`StateType::Utxo`, `StateType::Digest`, or
+  `StateType::Light`) determines which block sections are queued for download
+  via `required_section_ids`. `Light` returns an empty section list, so the
+  download phase is a no-op without special-casing in the sync loop.
 - `store`: `SyncStore` for checking modifier existence
-- `validator`: `BlockValidator` for digest/UTXO-mode block validation
+- `validator`: `Option<BlockValidator>` for digest/UTXO-mode block validation.
+  **`None` in `StateType::Light`** — the main crate's startup wiring branches
+  on `state_type` and constructs no validator for light mode. The watermark
+  scanner (`advance_validated_height`) is bypassed entirely when `validator`
+  is `None`; `validated_height` is set once at install time to the proof's
+  suffix tip and never advances from block validation thereafter.
 - `progress`: `mpsc::Receiver<u32>` from the validation pipeline. Carries chain
   height after each validated batch. Used for stall detection and the two-batch
-  SyncInfo pattern.
+  SyncInfo pattern. In light mode, this channel is constructed but never
+  produces values (no validator → no progress events) and the sync machine
+  treats progress as "infrequent" rather than "broken."
 - `delivery_control`: `mpsc::UnboundedReceiver<DeliveryControl>` from the pipeline.
   Carries `Reorg` and `NeedModifier` events. These are rare and critical — losing
   one is unrecoverable. Unbounded channel, never dropped.
 - `delivery_data`: `mpsc::Receiver<DeliveryData>` from the pipeline. Carries
   `Received` and `Evicted` modifier notifications. High-volume, lossy — missing
   one just delays the watermark scan by one timer tick. Bounded channel (capacity 64),
-  sent via `try_send`.
+  sent via `try_send`. In light mode this channel sees no traffic.
 
 ### `HeaderSync::run() -> !`
 - Long-running async task. Drives the sync loop until the runtime shuts down.
@@ -166,15 +175,122 @@ Critical findings from debugging sync against JVM 6.0.3 peers:
 - **Single peer per cycle**: the JVM syncs from one Older peer per 20-second cycle, not all peers simultaneously.
 - **SyncInfo response**: the JVM responds to incoming SyncInfo with its own SyncInfo when `syncSendNeeded` (status changed, peer outdated, status=Older/Fork). We don't respond during active sync to avoid sending stale chain state.
 
+## Light-Client Bootstrap (StateType::Light only)
+
+When `config.state_type == StateType::Light` AND the chain is empty at startup,
+the sync machine runs a one-shot NiPoPoW bootstrap BEFORE entering the normal
+sync cycle. The bootstrap installs the proof's suffix as the chain origin via
+`HeaderChain::install_from_nipopow_proof`; subsequent tip-following uses the
+existing header sync loop without modification.
+
+### `run_light_bootstrap(transport, chain, config) -> Result<(), LightBootstrapError>`
+
+Top-level entry point. Called by `HeaderSync::run` when `state_type == Light`
+AND `chain.is_empty()`. Idempotent: if the chain is already non-empty (e.g.,
+restart after a successful prior bootstrap), this is a no-op and the function
+returns immediately.
+
+State machine:
+
+1. **Wait for at least one outbound peer** with a delivery-eligible status
+   (handshake complete, not banned). Poll `transport.outbound_peers()` every
+   1s up to a 60s deadline. No peers → `LightBootstrapError::NoPeers`.
+
+2. **Send `GetNipopowProof`** to the first eligible peer with `m=6`, `k=10`,
+   `header_id = None` (no anchor — request a proof at the peer's current tip).
+   The wire envelope is built via `src/nipopow_serve::serialize_get_nipopow_proof`
+   (a new function — currently only the response serializer exists).
+
+3. **Wait for `NipopowProof` response** (P2P code 91) from that peer with a
+   30-second timeout. Other messages from other peers during this window are
+   processed normally by the rest of the sync machine; only `code == 91`
+   from the requested peer counts as the response. Timeout or wrong-peer
+   response → mark peer stalled, rotate to next eligible peer, retry up to
+   3 peers total. All 3 stalled → `LightBootstrapError::AllPeersStalled`.
+
+4. **Verify** the inner proof bytes via
+   `enr_chain::verify_nipopow_proof_bytes`. Verification failure → mark
+   peer hostile (NOT just stalled — sending an invalid proof is a protocol
+   violation), rotate, retry. Three hostile peers in a row →
+   `LightBootstrapError::AllPeersHostile`.
+
+5. **Install** the verified suffix into the local `HeaderChain`:
+   - The result's `headers: Vec<Header>` slice contains, in order:
+     `prefix`, then `suffix_head.header`, then `suffix_tail`. The light
+     client only installs the suffix portion (`suffix_head` + `suffix_tail`),
+     NOT the prefix headers — the prefix exists to prove cumulative work
+     and is discarded after verification.
+   - The split point inside `headers` is `headers.len() - k` (the last `k`
+     entries are the suffix; the rest is the prefix). With `k=10`, the
+     install passes `headers[headers.len()-10]` as `suffix_head` and the
+     remaining 9 as `suffix_tail`.
+   - On success, `chain.height()` returns the suffix tip's height. Set
+     the `validated_height` watermark to the same value (light mode treats
+     all installed headers as "validated" — the proof's PoW checks are
+     the validation).
+
+6. **Transition to normal tip-following sync** via the existing
+   `sync_from_peer` loop. From here on out, light mode behaves like full
+   mode minus block bodies: the sync machine sends SyncInfo, receives
+   header Inv, requests headers, validates them via `try_append`, and
+   advances the tip.
+
+### `LightBootstrapError`
+
+```rust
+pub enum LightBootstrapError {
+    NoPeers,
+    AllPeersStalled,
+    AllPeersHostile,
+    InstallFailed(ChainError),
+    StreamClosed,
+}
+```
+
+All variants are fatal to bootstrap — the sync machine logs and exits.
+The main crate decides whether to retry from scratch or terminate the node;
+for first release, terminate.
+
+### Bootstrap invariants
+
+- **Single peer per attempt**: bootstrap requests from ONE peer at a time.
+  Multi-peer best-arg comparison (KMZ17 §4.3, where the client compares
+  proofs from multiple peers and picks the one with highest cumulative work
+  via `bestArg`) is **out of scope for first release** and tracked as a
+  hardening follow-up. The first-release trust model is "trust the first
+  peer that returns a verifiable proof." This is documented as a known
+  limitation in the user-facing release notes.
+- **No restart-resume state**: bootstrap is one-shot and re-runs from
+  scratch on every restart where `chain.is_empty()`. Once the chain is
+  installed, subsequent restarts skip bootstrap entirely (chain is loaded
+  from store and is non-empty). There is no partial-bootstrap state that
+  needs persistence — the operation is atomic.
+- **Bootstrap NEVER mutates `store/`** beyond what `HeaderChain` itself
+  writes via its existing persistence path. The proof bytes are not
+  archived after install. If we want to re-verify the proof after a
+  reboot, we'd need to re-fetch it; this is not a first-release concern.
+
+### Trust model
+
+Standard SPV: single-peer bootstrap trusts that peer's view of the
+chain. Failure mode is liveness, not safety — a hostile peer causes a
+recoverable DoS, not loss of funds. Multi-peer best-arg comparison
+(KMZ17 §4.3) is the standard hardening, tracked as a follow-up.
+
 ## Block Section Download
 
 After header sync reaches the peer's tip, the sync machine downloads block sections
 for stored headers. Which sections are downloaded depends on `SyncConfig.state_type`:
 - **UTXO mode**: BlockTransactions (102) + Extension (108). No AD proofs.
 - **Digest mode**: all three including ADProofs (104).
+- **Light mode**: NONE. `required_section_ids` returns an empty Vec, the section
+  queue stays empty, and the watermark scanner has nothing to advance.
 
 This mirrors the JVM's `ToDownloadProcessor.requiredModifiersForHeader`, which calls
 `Header.sectionIdsWithNoProof` in UTXO mode and `Header.sectionIds` in digest mode.
+JVM has no light-mode analog at the section-id level (it gates the entire
+download phase via `nipopowBootstrap`); our chain crate folds the gating into
+`required_section_ids` returning empty, which keeps the sync loop unchanged.
 
 ### Download queue
 
