@@ -7,7 +7,7 @@ The handle to a running P2P layer. Created by `P2pNode::start()`. The P2P layer 
 ### `start(config, modifier_sink) -> Result<P2pNode>`
 - **Precondition**: Called within a tokio runtime.
 - **Postcondition**: Listeners, outbound connections, keepalive, and event loop are spawned as background tasks. Returns immediately.
-- If `modifier_sink` is `Some`, every modifier from a `ModifierResponse` is sent to the channel as `(modifier_type, id, data)` via the `Action::Validate` mechanism. The P2P layer never blocks on validation.
+- If `modifier_sink` is `Some`, every modifier from a `ModifierResponse` is sent to the channel as `(modifier_type, id, data, peer_id)` via the `Action::Validate` mechanism. `peer_id` is `Option<u64>` — `Some(id)` for peer-delivered modifiers, `None` for locally-ingested ones. The P2P layer never blocks on validation.
 
 ### `peer_count() -> usize`
 - Returns the number of currently connected peers (inbound + outbound).
@@ -38,7 +38,7 @@ The handle to a running P2P layer. Created by `P2pNode::start()`. The P2P layer 
 
 ## Router: Action::Validate
 
-The router emits `Action::Validate { modifier_type, id, data }` for each modifier in a `ModifierResponse`. The event loop dispatches these to the `modifier_sink` channel via `try_send` (non-blocking). If no sink is provided, validate actions are dropped (pure proxy mode).
+The router emits `Action::Validate { modifier_type, id, data, peer_id }` for each modifier in a `ModifierResponse`. `peer_id` identifies which peer sent the modifier, enabling penalty attribution when validation fails downstream. The event loop dispatches these to the `modifier_sink` channel as `(modifier_type, id, data, Some(peer_id.0))` via `try_send` (non-blocking). If no sink is provided, validate actions are dropped (pure proxy mode).
 
 The router does NOT validate modifiers. It routes them, emits them for external validation, and forwards to requesters. Validation is the pipeline's job.
 
