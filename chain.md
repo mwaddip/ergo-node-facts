@@ -290,23 +290,52 @@ State transitions inside `compute_expected_parameters` (port of
 
 ### Startup recomputation
 
-On `HeaderChain::open()` (or equivalent constructor that loads from store),
-the chain MUST rebuild `active_parameters()` before returning:
+`recompute_active_parameters_from_storage(target_height: u32)` rebuilds
+`active_parameters()` from storage to reflect the parameters in effect at
+`target_height`.
 
-1. Walk backwards from the current tip to find the most recent epoch-boundary
-   block (highest height H where `H % voting_length == 0`).
-2. Read that block's extension from `store/`.
-3. Parse parameters from the extension via JVM-equivalent logic (key prefix
+`target_height` is the height the validator is about to resume validating
+from — generally far behind the chain tip on a fresh resync, identical to
+the chain tip on a normal restart. The chain tip is **not** the right
+input for this function: a chain whose headers reach v6-era heights but
+whose UTXO state needs to be re-validated from genesis must load the v1-era
+parameter table at startup, not the v6-era one. Otherwise the locally
+computed expected table at the first epoch boundary (mainnet 1024) carries
+extra entries that the v1-era extension does not, and validation fails.
+
+Algorithm:
+
+1. If `target_height < voting_length`, no-op success — no epoch-boundary
+   block exists at or before that height, so `active_parameters` is left at
+   the chain-internal defaults from `HeaderChain::new`.
+2. Otherwise compute `boundary_height = (target_height / voting_length) *
+   voting_length` (the most recent epoch-boundary at or before
+   `target_height`).
+3. Read the extension at `boundary_height` via the registered extension
+   loader.
+4. Parse parameters from the extension via JVM-equivalent logic (key prefix
    `0x00` + 1-byte param ID + 4-byte BE i32 value, except ID 124
    `SoftForkDisablingRules` which has variable-length encoding).
-4. Set `active_parameters` to the parsed value.
+5. Verify the extension's `header_id` field matches the chain's header at
+   `boundary_height`; mismatch is an error.
+6. Set `active_parameters` to the parsed value.
 
-If no epoch-boundary block exists yet (chain shorter than one epoch),
-`active_parameters` returns `Parameters::default()`.
+Errors are returned only when a load is required (i.e., `target_height ≥
+voting_length`) and one of: the loader is unset; the loader returns `None`;
+the extension bytes fail to parse; the boundary header is missing from the
+chain (caller misuse — `target_height` exceeds the chain's known headers);
+the extension's header_id disagrees with the chain.
 
-Cost: bounded — at most `voting_length` blocks of backward walk, plus one
-extension read. Acceptable at startup. NOT cached to disk: derived state,
+Cost: bounded — exactly one extension read in the load case, zero in the
+no-op case. Acceptable at startup. NOT cached to disk: derived state,
 divergence-prone.
+
+The integrator (main crate) wires this on startup, passing the validator's
+current state height (the highest block already applied to UTXO state). On
+a fresh genesis resync the state height is `0`, the function is a no-op,
+and the chain's default parameters carry through to the first epoch
+boundary's `compute_expected_parameters` call — which is what JVM
+`Parameters` does in the equivalent path.
 
 ### Voting invariants
 
