@@ -69,8 +69,8 @@ How the sync machine queries and updates chain state.
 - `validator`: `Option<BlockValidator>` for digest/UTXO-mode block validation.
   **`None` in `StateType::Light`** — the main crate's startup wiring branches
   on `state_type` and constructs no validator for light mode. The watermark
-  scanner (`advance_validated_height`) is bypassed entirely when `validator`
-  is `None`; `validated_height` is set once at install time to the proof's
+  scanner (`advance_state_applied_height`) is bypassed entirely when `validator`
+  is `None`; `state_applied_height` is set once at install time to the proof's
   suffix tip and never advances from block validation thereafter.
 - `progress`: `mpsc::Receiver<u32>` from the validation pipeline. Carries chain
   height after each validated batch. Used for stall detection and the two-batch
@@ -141,10 +141,11 @@ arrives that creates a better chain (higher cumulative difficulty), the pipeline
 3. Executes `HeaderChain::try_reorg_deep()` to atomically swap the best chain.
 4. Sends `DeliveryControl::Reorg { fork_point, old_tip, new_tip }` to the sync machine.
 
-The sync machine responds by clearing its section queue, resetting both watermarks
-(`downloaded_height` and `validated_height`) to the fork point, resetting the
-block validator's state root, re-queuing sections for the new branch, and
-re-scanning the download watermark.
+The sync machine responds by draining in-flight eval results, clearing its section
+queue, resetting all three watermarks (`downloaded_height`, `state_applied_height`,
+and `script_verified_height`) to the fork point, resetting the block validator's
+state root, re-queuing sections for the new branch, and re-scanning the download
+watermark.
 
 For incomplete fork chains (parent not in store), the pipeline sends
 `DeliveryControl::NeedModifier` to request the missing parent header. Once it
@@ -325,23 +326,65 @@ Header sync takes priority. Block section download starts only after header sync
 reaches the `Synced` state. During active header sync, block section requests
 are paused to avoid saturating the peer's bandwidth.
 
-## Block Assembly (downloaded_height / validated_height)
+## Block Assembly (state_applied_height / script_verified_height)
 
-The sync machine tracks two watermarks:
+The sync machine tracks three watermarks:
 
-- **`downloaded_height`** — the highest height where all required block sections
-  are present in the store. Blocks at or below this height are ready for validation.
-- **`validated_height`** — the highest height where block sections have been
-  validated by the `BlockValidator`. Always `<= downloaded_height`.
+- **`downloaded_height`** — highest height where all required block sections
+  are present in the store.
+- **`state_applied_height`** — highest height where `apply_state()` returned Ok.
+  External consumers (API, mempool, mining) see this height.
+- **`script_verified_height`** — highest height where `evaluate_scripts()` has
+  completed successfully. Internal bookkeeping for rollback decisions.
+  Advances in-order as eval results arrive via crossbeam channel.
 
-Both are initialized from `validator.validated_height()` on startup.
+`downloaded_height` and `state_applied_height` are initialized from
+`validator.validated_height()` on startup. `script_verified_height` is
+persisted separately and loaded on startup.
+
+### Invariants
+
+- `script_verified_height <= state_applied_height <= downloaded_height <= chain_height`
+- `state_applied_height` is monotonically increasing (except on reorg or eval failure)
+- Heights at or below `script_verified_height` are fully validated (state + scripts)
+
+### Eval dispatch
+
+Script evaluation is dispatched to the rayon thread pool via `rayon::spawn`.
+Results are sent through `crossbeam_channel::Sender<(u32, Result<(), ValidationError>)>`.
+The sync layer drains the receiver non-blocking between blocks during the
+sweep, and blocking after the sweep completes.
+
+No backpressure. Memory per DeferredEval is ~25KB typical, ~410KB worst case.
+
+### At chain tip
+
+When `sweep_size == 1`, drain the eval channel synchronously after applying
+state. No pipeline benefit for a single block during live sync.
+
+### Eval failure handling
+
+On eval failure detection:
+1. Stop spawning new evals
+2. Drain remaining channel results (discard)
+3. Look up digest via `chain.header_at(failed_height - 1).state_root`
+4. Call `validator.reset_to(failed_height - 1, digest)`
+5. Reset `state_applied_height` and `script_verified_height` to `failed_height - 1`
+6. Reset `downloaded_height` to match
+7. Log the error, resume sync
+
+### Startup re-evaluation
+
+On startup, if `script_verified_height < state_applied_height`, rebuild
+`DeferredEval` for each gap block from stored sections and evaluate before
+entering the normal sync loop. Typically 0-5 blocks.
 
 ### Watermark scanner
 
 `advance_downloaded_height()` scans forward from the current watermark. For each
 height, it computes `required_section_ids(header, state_type)` and checks the
 store for each. Advances as far as possible, stops at the first gap. On advance,
-calls `advance_validated_height()` to run the block validator on newly downloaded blocks.
+calls `advance_state_applied_height()` to run the pipeline on newly downloaded blocks.
 
 ### Trigger points
 
@@ -352,12 +395,6 @@ calls `advance_validated_height()` to run the block validator on newly downloade
    faster than the sync machine processes events, so the timer ensures the
    scanner runs regardless.
 4. **Synced ticker**: every 30 seconds during the synced polling loop.
-
-### Invariants
-
-- `validated_height <= downloaded_height <= chain_height`
-- `validated_height` is monotonically increasing (except on reorg reset)
-- Heights at or below `validated_height` have verified state transitions
 
 ## Does NOT own
 

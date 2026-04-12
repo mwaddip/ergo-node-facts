@@ -34,7 +34,8 @@ transaction validation: S9  P8 E6 C5 I8 A7 L8
 
 ```rust
 pub trait BlockValidator {
-    /// Validate a block's sections against the current state.
+    /// Apply state transition: parse sections, compute state changes,
+    /// apply AVL operations, verify digest, persist.
     ///
     /// Preconditions:
     ///   - `header.height == self.validated_height() + 1`
@@ -43,25 +44,33 @@ pub trait BlockValidator {
     ///     for digest mode, None for UTXO mode
     ///   - `extension` is the raw Extension section (type 108)
     ///   - `preceding_headers` contains up to 10 headers before this block,
-    ///     newest first (for ErgoStateContext when script validation is enabled)
+    ///     newest first (for ErgoStateContext in DeferredEval)
+    ///   - `active_params` is the current chain parameters
+    ///   - `expected_boundary_params` is Some iff header.height is an
+    ///     epoch boundary
     ///
     /// Postconditions on Ok:
     ///   - `self.validated_height()` == header.height
     ///   - `self.current_digest()` == header.state_root
-    ///   - The state transition from the previous state root to header.state_root
-    ///     has been verified
+    ///   - State transition persisted (UTXO mode) or digest updated (digest mode)
+    ///   - `ApplyStateOutcome.deferred_eval` is Some if scripts need
+    ///     evaluation (height > checkpoint), None otherwise
+    ///   - `ApplyStateOutcome.epoch_boundary_params` is Some if this was
+    ///     an epoch-boundary block with verified parameters
     ///
     /// Postconditions on Err:
     ///   - State is unchanged. validated_height and current_digest are unmodified.
     ///   - The error describes which check failed.
-    fn validate_block(
+    fn apply_state(
         &mut self,
         header: &Header,
         block_txs: &[u8],
         ad_proofs: Option<&[u8]>,
         extension: &[u8],
         preceding_headers: &[Header],
-    ) -> Result<(), ValidationError>;
+        active_params: &Parameters,
+        expected_boundary_params: Option<&Parameters>,
+    ) -> Result<ApplyStateOutcome, ValidationError>;
 
     /// Current validated height. 0 means no blocks validated yet
     /// (genesis state root is set but no blocks applied).
@@ -70,7 +79,7 @@ pub trait BlockValidator {
     /// Current state root digest (33 bytes: 32-byte hash + 1-byte tree height).
     fn current_digest(&self) -> &ADDigest;
 
-    /// Reset to a previous state. Used on reorg.
+    /// Reset to a previous state. Used on reorg and deferred eval failure.
     ///
     /// Preconditions:
     ///   - `height < self.validated_height()`
@@ -80,7 +89,45 @@ pub trait BlockValidator {
     ///   - `self.validated_height()` == height
     ///   - `self.current_digest()` == digest
     fn reset_to(&mut self, height: u32, digest: ADDigest);
+
+    /// Compute AD proofs for transactions without modifying state.
+    /// None for digest-mode validators (mining requires UTXO mode).
+    fn proofs_for_transactions(&self, txs: &[Transaction])
+        -> Option<Result<(Vec<u8>, ADDigest), ValidationError>>;
+
+    /// Current emission box ID. None if digest mode or all ERG emitted.
+    fn emission_box_id(&self) -> Option<[u8; 32]>;
 }
+```
+
+## New Types
+
+```rust
+pub struct ApplyStateOutcome {
+    /// Some if this was an epoch-boundary block with verified parameters.
+    pub epoch_boundary_params: Option<Parameters>,
+    /// Some if scripts need evaluation (height > checkpoint).
+    pub deferred_eval: Option<DeferredEval>,
+}
+
+/// Everything needed to verify transaction spending proofs.
+/// Owned, Send — can move to any thread.
+pub struct DeferredEval {
+    pub height: u32,
+    pub transactions: Vec<Transaction>,
+    pub proof_boxes: HashMap<[u8; 32], ErgoBox>,
+    pub header: Header,
+    pub preceding_headers: Vec<Header>,
+    pub parameters: Parameters,
+}
+```
+
+## Free Function
+
+```rust
+/// Verify spending proofs for all transactions in a block.
+/// Pure computation — no validator state needed. Uses rayon par_iter internally.
+pub fn evaluate_scripts(eval: &DeferredEval) -> Result<(), ValidationError>;
 ```
 
 ## Phase 4a: DigestValidator
@@ -142,20 +189,17 @@ DigestValidator::new(
    - Verify `verifier.digest() == header.state_root`
    - On success, `current_digest` = `header.state_root`
 
-5. **Transaction validation** (skipped below checkpoint_height)
-   - Deserialize old values from step 4 into `ErgoBox` instances
-   - Build box lookup: transaction outputs + boxes from proofs
-   - For each transaction:
-     - `tx.validate_stateless()` — no double-spends, no overflow
-     - Build `TransactionContext::new(tx, input_boxes, data_boxes)`
-     - `tx_context.validate(&state_context)` — ERG/token preservation,
-       script verification, storage rent, box size limits
-   - `ErgoStateContext` built from: `preceding_headers` (last 10),
-     `PreHeader` from current header, protocol parameters from extension
-
-6. **Advance state**
+5. **Advance state** (immediate, before script eval)
    - `validated_height` = header.height
    - `current_digest` = header.state_root
+
+6. **Build DeferredEval** (skipped below checkpoint_height)
+   - Deserialize old values from step 4 into `ErgoBox` instances
+   - Bundle transactions, proof boxes, header, preceding headers, and
+     parameters into a `DeferredEval` struct
+   - Returned as `ApplyStateOutcome.deferred_eval` for the sync layer
+     to evaluate asynchronously via `evaluate_scripts()`
+   - `evaluate_scripts` uses rayon `par_iter` for intra-block parallelism
 
 ### Error causes
 
@@ -196,27 +240,30 @@ DigestValidator::new(
 
 ### Watermarks
 
+- `state_applied_height` — AVL state advanced to here. External consumers see this.
+- `script_verified_height` — scripts confirmed up to here. Internal bookkeeping.
 - `downloaded_height` — all required section bytes are present in the store.
-- `validated_height` — all blocks up to this height have been validated.
 
 ### Invariants
 
-- `validated_height <= downloaded_height <= chain_height`
-- `validated_height` is monotonically increasing (except on reorg reset)
-- Heights at or below `validated_height` have verified state transitions
+- `script_verified_height <= state_applied_height <= downloaded_height <= chain_height`
+- `state_applied_height` is monotonically increasing (except on reorg/eval-failure reset)
+- Heights at or below `script_verified_height` are fully validated (state + scripts)
 
-### `advance_validated_height()`
+### `advance_state_applied_height()`
 
 Triggered after `downloaded_height` advances or on a timer. For each height
-from `validated_height + 1` to `downloaded_height`:
+from `state_applied_height + 1` to `downloaded_height`:
 
-1. Get header from chain (`SyncChain::header_at(height)`)
-2. Get section bytes from store (`SyncStore::get_section(type_id, id)`)
-3. Get preceding headers from chain (up to 10 before this height)
-4. Call `validator.validate_block(header, block_txs, ad_proofs, extension,
-   preceding_headers)`
-5. On Ok: continue to next height
-6. On Err: stop, log error, do NOT advance watermark
+1. Get header, sections, preceding headers, active params
+2. Call `validator.apply_state(...)`
+3. On Ok: advance `state_applied_height`, apply epoch boundary params,
+   spawn `evaluate_scripts(deferred_eval)` on rayon pool if Some
+4. On Err: stop, log error, do NOT advance watermark
+
+Between blocks: non-blocking drain of eval result channel to advance
+`script_verified_height`. On eval failure: rollback (see Failure Handling
+in spec).
 
 ### SyncStore extension
 
@@ -229,15 +276,22 @@ fn get_modifier(&self, type_id: u8, id: &[u8; 32]) -> Option<Vec<u8>>;
 Reads section bytes from the store. The existing `has_modifier` checks existence;
 this returns the actual data for validation.
 
+### Startup re-evaluation
+
+On startup, if `script_verified_height < state_applied_height`, rebuild
+`DeferredEval` for gap blocks from stored sections and evaluate before
+resuming normal sync.
+
 ### Reorg handling
 
 On `DeliveryControl::Reorg { fork_point, .. }` (received via unbounded control channel):
-1. Reset `downloaded_height` to fork_point
-2. Get header at fork_point from chain
-3. Call `validator.reset_to(fork_point, header.state_root)`
-4. `validated_height` now equals fork_point
-5. Re-queue sections for the new branch, re-scan watermark
-6. Re-validate from fork_point + 1 as sections become available
+1. Drain and discard in-flight eval results
+2. Reset `downloaded_height` to fork_point
+3. Get header at fork_point from chain
+4. Call `validator.reset_to(fork_point, header.state_root)`
+5. `state_applied_height` and `script_verified_height` reset to fork_point
+6. Re-queue sections for the new branch, re-scan watermark
+7. Re-validate from fork_point + 1 as sections become available
 
 ## Does NOT own
 
