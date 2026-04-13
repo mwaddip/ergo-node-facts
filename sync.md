@@ -35,6 +35,25 @@ How the sync machine queries persistent storage.
 - Used to determine which block sections need downloading.
 - Must not block the async runtime (the bridge impl handles this).
 
+#### `get_modifier(type_id, id) -> Option<Vec<u8>>`
+- Retrieve raw modifier bytes from the store.
+- Returns None if not found. Used during validation sweeps to load
+  block sections (transactions, AD proofs, extensions) by type and ID.
+
+#### `script_verified_height() -> Option<u32>`
+- Read the persisted script_verified_height. Returns None if not set.
+- Used on startup to detect the gap between script-verified and
+  state-applied heights after an unclean shutdown.
+
+#### `set_script_verified_height(height)`
+- Persist the script_verified_height. Called every 100 blocks during
+  the sweep's drain of deferred eval results.
+
+#### `set_validator_height(height)`
+- Persist the state-applied height for fast startup. Called after each
+  sweep advancement. On the next startup, the main crate reads this
+  hint to skip the O(n) prover digest scan against all headers.
+
 ### `SyncChain`
 
 How the sync machine queries and updates chain state.
@@ -58,7 +77,7 @@ How the sync machine queries and updates chain state.
 
 ## HeaderSync
 
-### `HeaderSync::new(config, transport, chain, store, validator, progress, delivery_control, delivery_data) -> Self`
+### `HeaderSync::new(config, transport, chain, store, validator, progress, delivery_control, delivery_data, snapshot_tx, validator_rx, shared_downloaded_height) -> Self`
 - Create the sync state machine with injected dependencies.
 - `config`: `SyncConfig` with timing parameters, delivery settings, and `state_type`.
   The `state_type` field (`StateType::Utxo`, `StateType::Digest`, or
@@ -84,6 +103,14 @@ How the sync machine queries and updates chain state.
   `Received` and `Evicted` modifier notifications. High-volume, lossy — missing
   one just delays the watermark scan by one timer tick. Bounded channel (capacity 64),
   sent via `try_send`. In light mode this channel sees no traffic.
+- `snapshot_tx`: `Option<oneshot::Sender<SnapshotData>>` for UTXO snapshot bootstrap.
+  When present, the sync machine sends downloaded snapshot data to the main crate
+  for state loading. None when not in bootstrap mode.
+- `validator_rx`: `Option<oneshot::Receiver<V>>` to receive the validator back after
+  snapshot loading completes.
+- `shared_downloaded_height`: `Arc<AtomicU32>` published after each
+  `advance_downloaded_height`. Read by the API (`/info` → `downloadedHeight`) and
+  fastsync to determine which block sections are already in the store.
 
 ### `HeaderSync::run() -> !`
 - Long-running async task. Drives the sync loop until the runtime shuts down.
@@ -364,20 +391,35 @@ state. No pipeline benefit for a single block during live sync.
 
 ### Eval failure handling
 
-On eval failure detection:
-1. Stop spawning new evals
-2. Drain remaining channel results (discard)
-3. Look up digest via `chain.header_at(failed_height - 1).state_root`
-4. Call `validator.reset_to(failed_height - 1, digest)`
-5. Reset `state_applied_height` and `script_verified_height` to `failed_height - 1`
-6. Reset `downloaded_height` to match
-7. Log the error, resume sync
+Eval failures are detected in `drain_eval_results` during the sweep loop.
+Two detection points:
 
-### Startup re-evaluation
+**In-loop detection:** After each non-blocking drain, the sweep compares
+`state_applied_height` against its pre-drain value. If `handle_eval_failure`
+reduced it during the drain, the sweep corrects `validated_to` and breaks
+immediately — preventing the post-loop code from overwriting the rolled-back
+watermark with the stale `validated_to`. Without this check, the sweep would
+continue feeding blocks to a rolled-back validator (height mismatch) and then
+clobber `state_applied_height` back to the pre-rollback value.
 
-On startup, if `script_verified_height < state_applied_height`, rebuild
-`DeferredEval` for each gap block from stored sections and evaluate before
-entering the normal sync loop. Typically 0-5 blocks.
+**Post-sweep detection:** The blocking drain after sweep completion can also
+find failures. `handle_eval_failure` sets the correct watermarks directly;
+no post-drain code overwrites them.
+
+`handle_eval_failure` sequence:
+1. Drain and discard remaining channel results
+2. Look up digest via `chain.header_at(failed_height - 1).state_root`
+3. Call `validator.reset_to(failed_height - 1, digest)`
+4. Reset `state_applied_height` and `script_verified_height` to `failed_height - 1`
+5. Reset `downloaded_height` to match
+6. Log the error, resume sync
+
+### Startup gap handling
+
+On startup, if persisted `script_verified_height < state_applied_height`,
+the gap is accepted — the AVL digest already proved state correctness during
+`apply_state`, and proof boxes aren't available without re-running apply_state.
+`script_verified_height` is advanced to match `state_applied_height`.
 
 ### Watermark scanner
 

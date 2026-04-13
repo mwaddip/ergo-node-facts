@@ -118,6 +118,7 @@ Node status and chain state. No authentication.
   "network": "testnet",
   "fullHeight": 271234,
   "headersHeight": 271240,
+  "downloadedHeight": 271238,
   "bestFullHeaderId": "0000abcd...",
   "bestHeaderId": "0000efgh...",
   "stateRoot": "01abcdef...",
@@ -130,7 +131,14 @@ Node status and chain state. No authentication.
 ```
 
 **Source:** chain (heights, header IDs), mempool (unconfirmed count),
-peers (peer count), node_config (name, version, network, state type).
+peers (peer count), node_config (name, version, network, state type),
+sync layer (downloaded_height via shared atomic).
+
+`downloadedHeight` is the highest height where all required block sections
+are in the store. Used by fastsync to avoid re-fetching sections that
+already exist. Distinct from `fullHeight` (validated) — after a state wipe,
+`fullHeight` resets to 0 but `downloadedHeight` reflects what's still in the
+modifiers store.
 
 ---
 
