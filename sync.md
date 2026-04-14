@@ -399,7 +399,7 @@ Once during startup, the main crate:
    the shared `Arc<AtomicU32>` (initialized from the validator's persisted
    height).
 4. If `gap > fastsync_threshold_blocks` AND the fastsync binary is available
-   AND `enable_fastsync == true` in config, the main crate spawns fastsync
+   AND `fastsync == true` in config, the main crate spawns fastsync
    as a subprocess and waits for it to exit before opening the P2P
    block-request gate.
 5. Otherwise, proceeds directly to P2P sync.
@@ -423,14 +423,17 @@ The main node exposes these config keys (location: node config, not
 sync crate's):
 
 ```
-enable_fastsync: bool                # default: true
+fastsync: bool                       # default: true
 fastsync_threshold_blocks: u32       # default: 25_000
 fastsync_peer_wait_timeout_sec: u32  # default: 30
 ```
 
-Operators who want to disable fastsync entirely can set
-`enable_fastsync = false`, or simply not install the binary. Operators who
-want to tune the trigger threshold can adjust `fastsync_threshold_blocks`.
+Operators who want to disable fastsync entirely can set `fastsync = false`,
+or simply not install the binary. Operators who want to tune the trigger
+threshold can adjust `fastsync_threshold_blocks`. The fastsync addon
+inherits the threshold from this config (passed via `--handoff-distance`
+when spawned by the main node); standalone fastsync invocations default to
+the same 25,000 so the two sides agree out of the box.
 
 ### P2P behavior during fastsync
 
