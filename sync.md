@@ -77,7 +77,7 @@ How the sync machine queries and updates chain state.
 
 ## HeaderSync
 
-### `HeaderSync::new(config, transport, chain, store, validator, progress, delivery_control, delivery_data, snapshot_tx, validator_rx, shared_downloaded_height) -> Self`
+### `HeaderSync::new(config, transport, chain, store, validator, progress, delivery_control, delivery_data, snapshot_tx, validator_rx, shared_downloaded_height, block_request_gate, peer_chain_tip) -> Self`
 - Create the sync state machine with injected dependencies.
 - `config`: `SyncConfig` with timing parameters, delivery settings, and `state_type`.
   The `state_type` field (`StateType::Utxo`, `StateType::Digest`, or
@@ -111,6 +111,19 @@ How the sync machine queries and updates chain state.
 - `shared_downloaded_height`: `Arc<AtomicU32>` published after each
   `advance_downloaded_height`. Read by the API (`/info` → `downloadedHeight`) and
   fastsync to determine which block sections are already in the store.
+- `block_request_gate`: `Arc<AtomicBool>` controlling whether `request_announced`
+  and the `handle_delivery_check` retry path actually send `ModifierRequest`.
+  When `false` (closed), all block/header/tx modifier requests are skipped —
+  the sync machine still processes incoming events (Inv, SyncInfo, modifier
+  responses) but does not emit any outgoing requests. The main crate owns
+  this flag: closed at construction, opened after the boot-time bootstrap
+  decision resolves (see "Bootstrap Mode" section below). Once opened, stays
+  open for the lifetime of the process.
+- `peer_chain_tip`: `Arc<AtomicU32>` published on every incoming `SyncInfo`
+  from any peer. Stores the maximum height observed in any peer's tip-first
+  heights vector. Read by the main crate to compute the bootstrap gap
+  (`peer_chain_tip - downloaded_height`). Initialized to 0; remains 0 until
+  at least one `SyncInfo` is received.
 
 ### `HeaderSync::run() -> !`
 - Long-running async task. Drives the sync loop until the runtime shuts down.
