@@ -353,6 +353,146 @@ Header sync takes priority. Block section download starts only after header sync
 reaches the `Synced` state. During active header sync, block section requests
 are paused to avoid saturating the peer's bandwidth.
 
+## Bootstrap Mode (Optional Fastsync)
+
+When a node starts with a large gap between the network's chain tip and the
+local `downloaded_height`, the main crate MAY delegate bulk block fetching
+to the **fastsync addon** — a separate process that fetches headers and
+block sections via REST from multiple peers in parallel, rather than
+serialized `ModifierRequest` over P2P.
+
+### No dependency
+
+Fastsync is an **optional external process**. The main `ergo-node` crate has
+no Cargo dependency on the fastsync crate. No shared types, no library
+imports. Communication is exclusively via:
+
+- Process boundary: `std::process::Command` spawn + wait on exit.
+- REST: fastsync is a client of the main node's ingestion API (see `facts/api.md`).
+
+If the fastsync binary is not present on the host, the addon is disabled in
+config, or fastsync exits with a non-zero status, the main node MUST
+continue correctly via P2P-only sync. A missing or broken fastsync is never
+a node-fatal error. The main crate **ignores the exit status** — any exit
+(clean or crash) means "move on to P2P mode." Retry semantics are out of
+scope: validation catches poisoned data, and P2P fetches whatever fastsync
+didn't deliver.
+
+### Boot-time decision
+
+Once during startup, the main crate:
+
+1. Waits for at least one connected outbound peer to deliver a `SyncInfo`
+   message, with a bounded timeout (default 30 seconds — same order of
+   magnitude as `run_light_bootstrap`'s peer-wait).
+2. If the timeout expires with no `SyncInfo` received, skips fastsync and
+   proceeds to P2P-only sync. A node with no peers can't bootstrap either
+   way; fastsync adds no value.
+3. Otherwise computes:
+
+   ```
+   gap = peer_reported_chain_tip - downloaded_height
+   ```
+
+   `peer_reported_chain_tip` is the highest tip seen in any incoming
+   `SyncInfo` received during the wait. `downloaded_height` is read from
+   the shared `Arc<AtomicU32>` (initialized from the validator's persisted
+   height).
+4. If `gap > fastsync_threshold_blocks` AND the fastsync binary is available
+   AND `enable_fastsync == true` in config, the main crate spawns fastsync
+   as a subprocess and waits for it to exit before opening the P2P
+   block-request gate.
+5. Otherwise, proceeds directly to P2P sync.
+
+### Threshold rationale
+
+The default threshold of 25,000 blocks corresponds to approximately 35 days
+of chain depth at the 2-minute target block time. Data at that depth has
+been buried under ~25,000 blocks of PoW and is overwhelmingly likely to be
+honest. The trust model is: "trust peer-returned data for deep chain
+history; verify downstream via the normal validation pipeline." Any bad
+data that slips through is caught by PoW verification, header chain
+validation, AD proof verification, and script evaluation — the same
+pipeline that validates P2P-delivered data. Fastsync does not bypass
+validation; it only accelerates delivery.
+
+### Config
+
+The main node exposes these config keys (location: node config, not
+`SyncConfig` — bootstrap orchestration is the main crate's job, not the
+sync crate's):
+
+```
+enable_fastsync: bool                # default: true
+fastsync_threshold_blocks: u32       # default: 25_000
+fastsync_peer_wait_timeout_sec: u32  # default: 30
+```
+
+Operators who want to disable fastsync entirely can set
+`enable_fastsync = false`, or simply not install the binary. Operators who
+want to tune the trigger threshold can adjust `fastsync_threshold_blocks`.
+
+### P2P behavior during fastsync
+
+While fastsync is running, the main node's P2P layer continues to
+participate in the network with one exception:
+
+- **Connections stay up.** Outbound and inbound peers remain connected,
+  handshakes complete, keep-alives and peer discovery run normally.
+- **SyncInfo exchange continues.** The sync machine MAY send and process
+  `SyncInfo` messages to signal progress and observe the current chain tip.
+- **`ModifierRequest` is gated off.** The sync machine does not request
+  headers or block sections from peers while fastsync is running; fastsync
+  is fetching them via REST in parallel. Incoming `Inv` messages do not
+  produce outgoing requests during this window.
+- **Gate opens on fastsync exit.** When the fastsync subprocess terminates
+  (regardless of exit status), the main crate opens the P2P block-request
+  gate and the sync state machine proceeds with normal tip-following sync.
+
+### Fastsync interface (from main node's perspective)
+
+Fastsync is a REST client. It writes data into the main node via the
+existing ingestion endpoints (see `facts/api.md`). The main node:
+
+- Exposes those endpoints unconditionally (not gated on bootstrap state).
+- Receives headers and block sections, stores them via the normal store
+  write path, and advances `downloaded_height` via the watermark scanner.
+- Runs the validation pipeline on delivered data concurrently, advancing
+  `state_applied_height` and `script_verified_height` normally.
+
+The main node does NOT supervise fastsync's peer selection, fetch strategy,
+or internal state. It waits for the subprocess to exit and then transitions
+to P2P mode. Whether fastsync closed the gap, partially closed it, or
+failed, the main node's behavior is identical: open the gate and run
+normal sync.
+
+### Exit condition
+
+Fastsync exits when either:
+- Its own gap check reports `chain_tip - downloaded_height` has closed to
+  within `fastsync_threshold_blocks`, OR
+- It encounters a fatal error (no peers, all peers misbehaving, REST
+  unreachable, addon crash).
+
+Both cases trigger the same main-crate response:
+1. Log the exit status and duration.
+2. Open the P2P block-request gate.
+3. Continue with normal sync.
+
+### No re-trigger
+
+Fastsync is **boot-only**. Once the main node exits bootstrap mode (fastsync
+has completed or was skipped), it never re-spawns fastsync during the
+lifetime of the process. If the node falls far behind during normal
+operation (network partition, long hibernation, misbehaving peers), it
+catches up via P2P only. Restarting the node triggers a fresh boot-time
+gap check.
+
+Rationale: once a node is near tip, the P2P 192-block window keeps up with
+the mean block interval. The "far behind while running" case is rare enough
+that the added complexity of continuous monitoring and mode transitions
+isn't justified. Restart is an acceptable recovery mechanism.
+
 ## Block Assembly (state_applied_height / script_verified_height)
 
 The sync machine tracks three watermarks:
@@ -446,6 +586,8 @@ calls `advance_state_applied_height()` to run the pipeline on newly downloaded b
 - Network I/O — that's `enr-p2p`
 - Section ID computation — that's `enr-chain` (`section_ids()` / `required_section_ids()`)
 - Fork choice / reorg execution — that's the pipeline (via `HeaderChain::try_reorg_deep`)
+- Bootstrap orchestration — that's the main crate (decides whether to spawn
+  fastsync at boot, gates P2P block requests during bootstrap)
 
 ## Future Extensions
 
