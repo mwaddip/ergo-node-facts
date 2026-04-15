@@ -58,9 +58,19 @@ Single redb file: `<data_dir>/state.redb`
 | Key | Value | Format |
 |-----|-------|--------|
 | `"top_node_hash"` | Root node's label | 32 bytes |
-| `"top_node_height"` | Tree height | 4 bytes BE (u32) |
+| `"top_node_height"` | AVL tree depth | 4 bytes BE (u32) |
 | `"current_version"` | Current ADDigest | 33 bytes |
 | `"lsn"` | Latest logical sequence number | 8 bytes BE (u64) |
+| `"versions"` | Serialized version chain (LSN+digest per entry) | variable |
+| `"block_height"` | Caller-supplied block height at current version | 4 bytes BE (u32) |
+
+`top_node_height` is the AVL+ tree's depth (a structural property of the
+tree).  `block_height` is the caller's notion of "which block produced
+this state" — opaque to this crate.  Writers supply it via
+`update_with_height()` / `load_snapshot()`; readers fetch it via
+`block_height()`.  It is written in the same redb transaction as every
+state change, so `block_height()` and `version()` can never disagree
+across a crash boundary.
 
 ### Node serialization
 
@@ -85,12 +95,17 @@ Per-version, serialized as:
     [label: 32B]
 [prev_top_node_hash: 32B]
 [prev_top_node_height: u32]
-[prev_version: 33B]
+[prev_version_len: u32]
+[prev_version: prev_version_len bytes]
+[prev_block_height: u32]    — appended trailing field
 ```
 
 - **Removed nodes**: labels + full packed bytes (to re-insert on rollback)
 - **Inserted nodes**: labels only (to delete on rollback — bytes not needed)
 - **Previous metadata**: restores the pre-update root state on rollback
+- **prev_block_height** was appended after the original format shipped.
+  Deserialization treats missing trailing bytes as `0` so pre-revision
+  records still parse.  New records always carry the field.
 
 ## Trait Implementation: `VersionedAVLStorage`
 
@@ -107,10 +122,47 @@ pub trait VersionedAVLStorage {
     fn version(&self) -> Option<ADDigest>;
 
     fn rollback_versions<'a>(&'a self) -> Box<dyn Iterator<Item = ADDigest> + 'a>;
+
+    /// Force a durable commit.  Default is a no-op.  Implementations using
+    /// deferred durability (e.g. `Durability::None` on redb) must fsync
+    /// the backing store here.  Callers invoke periodically during long
+    /// write sequences and on graceful shutdown.
+    fn flush(&self) -> Result<()> { Ok(()) }
 }
 ```
 
-### `update()` — persist tree changes after a batch of operations
+The trait itself is block-height-unaware — it stays generic.  The block
+height pathway is an inherent addition on `RedbAVLStorage`
+(`update_with_height`, `block_height`, `load_snapshot` with the
+`block_height` parameter).  Block-applying callers hold a concrete
+`RedbAVLStorage` and call `update_with_height` directly rather than
+going through `PersistentBatchAVLProver::generate_proof_and_update_storage`
+— the prover's AD proof is fetched afterward via
+`BatchAVLProver::generate_proof()`.
+
+### `update()` / `update_with_height()` — persist tree changes
+
+```rust
+impl VersionedAVLStorage for RedbAVLStorage {
+    fn update(&mut self, prover, additional_data) -> Result<()>;
+}
+
+impl RedbAVLStorage {
+    pub fn update_with_height(
+        &mut self,
+        prover: &mut BatchAVLProver,
+        additional_data: Vec<(ADKey, ADValue)>,
+        block_height: u32,
+    ) -> Result<()>;
+}
+```
+
+Both delegate to a single internal routine.  The only difference:
+`update_with_height` replaces the stored `block_height` with the
+caller's value; `update()` preserves whatever was there (so plain
+`update()` on non-empty storage never loses a previously-set
+block_height).  On empty storage, plain `update()` initializes
+block_height to `0`.
 
 **Preconditions:**
 - The prover has had operations applied via `perform_one_operation()`
@@ -124,20 +176,26 @@ pub trait VersionedAVLStorage {
    - Serialize each via `AVLTree::pack(node)`
    - Key = `node.label()` (32-byte Digest32)
 3. Call `prover.removed_nodes()` to get labels of nodes no longer in the tree
-4. For each removed label, read its current packed bytes from `nodes` table
-5. Write undo record:
+4. Read `prev_block_height` from metadata (defaults to 0 if empty)
+5. For each removed label, read its current packed bytes from `nodes` table
+6. Write undo record:
    - Removed nodes: their labels + packed bytes (for re-insertion on rollback)
    - Inserted nodes: their labels (for deletion on rollback)
-   - Previous top_node_hash, top_node_height, current_version
-6. Write new/modified nodes to `nodes` table
-7. Delete removed node labels from `nodes` table
-8. Store `additional_data` entries in `nodes` table (metadata from caller)
-9. Update metadata: top_node_hash, top_node_height, current_version, lsn++
-10. Prune undo records older than `keep_versions` from the tip
-11. Commit transaction
+   - Previous top_node_hash, top_node_height, current_version, **block_height**
+7. Write new/modified nodes to `nodes` table
+8. Delete removed node labels from `nodes` table
+9. Store `additional_data` entries in `nodes` table (metadata from caller)
+10. Update metadata: top_node_hash, top_node_height, current_version, lsn++,
+    **block_height** (caller-supplied for `update_with_height`, else the
+    `prev_block_height` read in step 4)
+11. Prune undo records older than `keep_versions` from the tip
+12. Commit transaction
 
 **Postconditions on Ok:**
 - `version()` returns the new ADDigest
+- `block_height()` returns the caller-supplied height (or the preserved
+  prior value if `update()` was used) — same commit, cannot diverge from
+  `version()` across a crash
 - All new/modified nodes are durable in the `nodes` table
 - All removed nodes are deleted from `nodes` but preserved in `undo`
 - An undo record exists for this version (unless `keep_versions == 0`)
@@ -159,14 +217,15 @@ pub trait VersionedAVLStorage {
 2. For each undo record (newest first):
    - Delete inserted node labels from `nodes` table
    - Re-insert removed nodes (label → packed bytes) into `nodes` table
-3. Restore metadata from the target version's undo record (top_node_hash,
-   top_node_height, current_version)
+3. Restore metadata from the target version's undo record: top_node_hash,
+   top_node_height, current_version, **block_height**
 4. Delete undo records for rolled-back versions
 5. Commit transaction
 6. Unpack the root node from storage and return `(NodeId, height)`
 
 **Postconditions on Ok:**
 - `version()` returns the target ADDigest
+- `block_height()` returns the value committed at the target version
 - `nodes` table contains exactly the tree state at that version
 - Rolled-back undo records are deleted (rollback is not reversible)
 
@@ -177,6 +236,47 @@ pub trait VersionedAVLStorage {
 
 Returns `None` if no updates have been applied (empty storage).
 Returns `Some(digest)` matching the last successful `update()`.
+
+### `block_height()` — caller-supplied block height at the current version
+
+```rust
+impl RedbAVLStorage {
+    pub fn block_height(&self) -> Option<u32>;
+}
+```
+
+Returns `None` iff `version()` is `None` (empty storage).  Otherwise
+returns the `u32` the caller passed to the most recent
+`update_with_height()` / `load_snapshot()`, or the value preserved by
+`update()`, or the value restored by `rollback()`.
+
+Invariant: `block_height().is_some() == version().is_some()`.  Once
+set, block_height stays set — every mutating operation writes it in
+the same transaction as the rest of the metadata, so there is no
+crash-consistent state in which one exists and the other doesn't.
+
+**Legacy migration:** a state.redb file written before the
+block_height revision has `version()` set but no `block_height` key.
+`open()` detects that and writes `block_height = 0` to restore the
+invariant.  Callers that see `Some(0)` should treat it as ambiguous —
+either a fresh genesis state, or legacy data — and fall back to a
+header scan to disambiguate.  Non-zero values are always authoritative.
+
+### `flush()` — force durable commit
+
+```rust
+impl VersionedAVLStorage {
+    fn flush(&self) -> Result<()>;
+}
+```
+
+`update()` commits with `Durability::None` — fast, but the commit
+pointer may still be in the OS page cache when the process exits.
+`flush()` runs an empty write transaction at `Durability::Immediate`,
+which fsyncs all outstanding data and the metadata pointer, including
+prior `None`-durability commits.  Call periodically in long write
+sequences (every N blocks in the sync loop) and on graceful shutdown
+to bound worst-case data loss to the flush interval.
 
 ### `rollback_versions()` — available rollback targets
 
@@ -395,6 +495,7 @@ impl RedbAVLStorage {
     /// Postconditions:
     ///   - All nodes are in the `nodes` table
     ///   - version() returns the provided digest
+    ///   - block_height() returns the provided block_height
     ///   - No undo records exist (rollback impossible before this point)
     pub fn load_snapshot(
         &mut self,
@@ -402,9 +503,15 @@ impl RedbAVLStorage {
         root_hash: Digest32,
         root_height: usize,
         version: ADDigest,
+        block_height: u32,
     ) -> Result<()>;
 }
 ```
+
+`block_height` is written to metadata in the same transaction as the
+bulk node load.  Pass the block height the snapshot was taken at — the
+caller on resume reads `block_height()` to know exactly which block
+the loaded UTXO set corresponds to.
 
 The snapshot format (manifest + subtrees) is parsed by the caller. The state
 crate receives pre-serialized `(label, packed_bytes)` pairs.
