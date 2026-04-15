@@ -58,19 +58,107 @@ parent linkage, PoW validity, timestamp bounds, and correct difficulty.
 #### `height() -> u32`
 - Returns the height of the best validated chain tip.
 
-#### `header_at(height: u32) -> Option<&Header>`
+#### `header_at(height: u32) -> Option<Header>`
 - Returns the header at the given height on the best chain, if it exists.
+- **Ownership**: Returns an owned `Header`. Chain no longer materializes
+  every header in memory; lookups fall through a bounded LRU cache to a
+  `HeaderLoader` (see "Lazy header store" below). Callers that previously
+  held `&Header` tied to `&HeaderChain` now hold an owned value that
+  outlives any chain mutation — strictly more permissive.
 
-#### `tip() -> &Header`
+#### `tip() -> Header`
 - **Precondition**: Chain is non-empty (at least genesis or bootstrap point).
 - Returns the tip header of the best validated chain.
+- **Ownership**: Same as `header_at` — returns owned. The tip is always
+  resident in cache (just pushed), so this never hits the loader.
+- Panics on an empty chain — unchanged behavior; only the return ownership
+  changed.
 
 #### `contains(header_id: &HeaderId) -> bool`
 - Returns whether this header ID is part of the validated chain.
 
-#### `headers_from(height: u32, count: usize) -> Vec<&Header>`
-- Returns up to `count` sequential headers starting at `height`.
+#### `headers_from(height: u32, count: usize) -> Vec<Header>`
+- Returns up to `count` sequential owned headers starting at `height`.
 - Used by sync to serve header chains to peers.
+- **Ownership**: Returns owned `Header`s. Consumers using `.iter()` on the
+  result still get `&Header` via the owned `Vec`, no call-site change
+  required.
+
+#### `score_at(height: u32) -> Option<BigUint>`
+- Returns the cumulative difficulty score at the given height on the best
+  chain, if it exists.
+- **Ownership**: Owned `BigUint`. Same LRU-cache + loader pattern as
+  `header_at`, via the separate `ScoreLoader` (see below). Split from the
+  header loader so walks that only need headers (difficulty recalc,
+  NiPoPoW) don't pay `BigUint` deserialization on every lookup.
+
+#### `cumulative_score() -> BigUint`
+- Returns the cumulative difficulty score at the chain tip.
+- Returns `BigUint::ZERO` on an empty chain (pre-existing behavior).
+- In the common case the tip's score is cache-resident and this does not
+  hit the loader.
+
+### Lazy header store
+
+`HeaderChain` owns a bounded LRU cache of recently-accessed headers (and a
+parallel cache for scores). Misses fall through to a loader registered by
+the integrator (typically backed by `enr-store`). This replaces the prior
+"materialize every header in memory" behavior; at 1.76M mainnet headers
+that was ~1.4 GB of live heap.
+
+```rust
+pub type HeaderLoader =
+    Arc<dyn Fn(u32) -> Option<Header> + Send + Sync + 'static>;
+
+pub type ScoreLoader =
+    Arc<dyn Fn(u32) -> Option<BigUint> + Send + Sync + 'static>;
+
+pub const DEFAULT_CACHE_CAPACITY: usize = 16_384;
+```
+
+`DEFAULT_CACHE_CAPACITY = 16_384` is sized to cover the difficulty
+adjustment walk (mainnet `use_last_epochs * epoch_length = 8 * 1024 =
+8192` headers) plus a full `finalization_depth` deep reorg (1440 blocks)
+with generous slack.
+
+#### `set_header_loader<F>(loader: F)`
+Where `F: Fn(u32) -> Option<Header> + Send + Sync + 'static`.
+- **Postcondition**: Subsequent `header_at` / `tip` / `headers_from` calls
+  that miss the in-process cache consult the loader. If the loader
+  returns `None` for a queried height, the chain returns `None` for that
+  query.
+- **Wired by**: the integrator (main crate) to bridge `enr-store`'s
+  height-indexed header reads.
+
+#### `set_score_loader<F>(loader: F)`
+Where `F: Fn(u32) -> Option<BigUint> + Send + Sync + 'static`.
+- **Postcondition**: Subsequent `score_at` / `cumulative_score` calls
+  that miss the cache consult the loader.
+
+#### `has_header_loader() -> bool` / `has_score_loader() -> bool`
+- Diagnostic queries so the integrator can assert wiring completeness
+  before the first user query arrives.
+
+#### `set_cache_capacity(capacity: NonZeroUsize)`
+- **Postcondition**: Both the header cache and the score cache are
+  resized to `capacity` in place. Excess entries beyond the new cap are
+  evicted in LRU order.
+- **Default**: `DEFAULT_CACHE_CAPACITY` (16_384 entries).
+
+### Cache invariants
+
+- **Write-through**. `push_header`, `pop_header`, `restore_header`,
+  `rollback_install`, `install_from_nipopow_proof`, and the deep-reorg
+  drain/restore paths all update the cache in lockstep with the canonical
+  state. A cache hit is never stale relative to the best chain at the
+  moment of the hit.
+- A cache miss that falls through to a loader returning `None` is
+  equivalent to the queried height being absent from the chain — the
+  public read method returns `None` (or panics, for `tip()` on an empty
+  chain).
+- Reorg rollback evicts the affected heights from both caches before
+  installing the new fork — post-reorg queries re-populate from the
+  loader or the fork's new headers.
 
 ### Difficulty Adjustment
 
