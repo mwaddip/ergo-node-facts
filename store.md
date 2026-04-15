@@ -133,6 +133,14 @@ pub trait ModifierStore: Send + Sync {
 
     /// Get the best chain tip (highest height and header ID).
     fn best_header_tip(&self) -> Result<Option<(u32, [u8; 32])>, Self::Error>;
+
+    /// Read the stored header bytes at a best-chain height.
+    /// Single read transaction combining best_header_at + get(101, id).
+    /// Returns Ok(None) if no best-chain entry at that height.
+    fn read_header_at(
+        &self,
+        height: u32,
+    ) -> Result<Option<Vec<u8>>, Self::Error>;
 }
 ```
 
@@ -215,6 +223,10 @@ guarded by `header_forks.len() > 0` and runs until the guard trips.
 - **`contains`**: Equivalent to `get(..).map(|o| o.is_some())` but avoids reading data.
 - **`tip`**: Returns the highest `(height, id)` pair. For type 101 this is the
   best-chain tip.
+- **`read_header_at`**: Returns the raw header bytes stored for the best-chain
+  header at `height`, or `None` if no such entry exists. Consistent with
+  `best_header_at` — if `best_header_at(h) == Some(id)` then
+  `read_header_at(h) == get(101, &id)`.
 
 ## Invariants
 
