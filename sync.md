@@ -49,11 +49,6 @@ How the sync machine queries persistent storage.
 - Persist the script_verified_height. Called every 100 blocks during
   the sweep's drain of deferred eval results.
 
-#### `set_validator_height(height)`
-- Persist the state-applied height for fast startup. Called after each
-  sweep advancement. On the next startup, the main crate reads this
-  hint to skip the O(n) prover digest scan against all headers.
-
 ### `SyncChain`
 
 How the sync machine queries and updates chain state.
