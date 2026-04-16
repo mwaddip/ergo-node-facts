@@ -346,12 +346,49 @@ Chain owns the live instance; consumers query it via `active_parameters()`.
   byte: positive = increase, negative = decrease, 0 = no vote, 120 = SoftFork.
 - **Helper for `compute_expected_parameters`**, exposed for testability.
 
-### `apply_epoch_boundary_parameters(params: Parameters)`
-- **Precondition**: `params` was returned by `compute_expected_parameters` for
-  the height of the just-validated epoch-boundary block AND was confirmed to
-  match the params parsed from that block's extension.
-- **Postcondition**: `active_parameters()` returns `params`.
-- **Called by**: validator after the epoch-boundary block has passed all checks.
+### `active_proposed_update_bytes() -> &[u8]`
+- **Postcondition**: Returns the raw `ErgoValidationSettingsUpdate`
+  encoding (JVM `Parameters.proposedUpdate`) in effect at the current
+  chain tip. This is the exact payload of extension key `[0x00, 124]`
+  (`SoftForkDisablingRules`) from the most recently applied
+  epoch-boundary block.
+- **Invariant**: On a fresh chain (before any boundary has been
+  applied) returns `default_proposed_update_bytes(network)` — JVM
+  `LaunchParameters.proposedUpdate` encoded via
+  `encode_disabled_rules(&[215, 409])` (6 bytes on both nets).
+  After every accepted boundary block, advances to that block's
+  exact ID 124 bytes. Forms the "expected" side of JVM
+  `Parameters.matchParameters60`'s `proposedUpdate` comparison;
+  the main-crate validator runs that comparison gated on
+  `BlockVersion >= Interpreter60Version` (no-op on mainnet until
+  h=1,628,160).
+- **Rationale for raw bytes**: `ErgoValidationSettingsUpdateSerializer`
+  writes canonically (sorted `rulesToDisable` + `statusUpdates`), so
+  byte-for-byte comparison is equivalent to structural equality, and
+  we avoid pulling a full `ErgoValidationSettingsUpdate` type into
+  the chain crate (sigma-rust does not yet expose one on its
+  `Parameters`). `statusUpdates` modeling is future work — the
+  current encoder emits empty statusUpdates, which is correct for the
+  launch default but diverges from on-chain mainnet payloads that
+  carry 3 status updates since before h=1,562,624.
+
+### `apply_epoch_boundary_parameters(params: Parameters, proposed_update_bytes: Vec<u8>)`
+- **Preconditions**:
+  - `params` was returned by `compute_expected_parameters` for the
+    height of the just-validated epoch-boundary block AND was
+    confirmed to match the params parsed from that block's extension.
+  - `proposed_update_bytes` is the block's exact ID 124 extension
+    value (empty `Vec` if absent — JVM's
+    `ErgoValidationSettingsUpdate.empty` convention). On
+    `BlockVersion >= Interpreter60Version` the validator has already
+    compared this byte-for-byte against
+    `active_proposed_update_bytes()` before calling.
+- **Postcondition**: `active_parameters()` returns `params` AND
+  `active_proposed_update_bytes()` returns `proposed_update_bytes`.
+  Both fields advance atomically — no partial updates.
+- **Called by**: block-application pipeline after the epoch-boundary
+  block has passed all checks. Validators do NOT call this (they
+  are stateless w.r.t. chain state mutation).
 
 ### `is_epoch_boundary(height: u32) -> bool`
 - **Postcondition**: Returns true iff `height % voting_length == 0` AND
@@ -421,7 +458,16 @@ Algorithm:
    `SoftForkDisablingRules` which has variable-length encoding).
 5. Verify the extension's `header_id` field matches the chain's header at
    `boundary_height`; mismatch is an error.
-6. Set `active_parameters` to the parsed value.
+6. Extract the raw ID 124 payload from the extension's key-value
+   pairs. If present, set `active_proposed_update_bytes` to those
+   bytes. If absent, fall back to
+   `default_proposed_update_bytes(network)` — JVM treats an absent
+   ID 124 field as `ErgoValidationSettingsUpdate.empty`, but a
+   post-v6 mainnet boundary without the field would indicate a
+   corrupt extension; the fallback keeps the field well-formed for
+   the subsequent boundary's `apply_epoch_boundary_parameters` call
+   to overwrite.
+7. Set `active_parameters` to the parsed value.
 
 Errors are returned only when a load is required (i.e., `target_height ≥
 voting_length`) and one of: the loader is unset; the loader returns `None`;
@@ -442,14 +488,32 @@ boundary's `compute_expected_parameters` call — which is what JVM
 
 ### Voting invariants
 
-- `active_parameters` advances ONLY at epoch-boundary blocks. Within an
-  epoch it is constant.
+- `active_parameters` and `active_proposed_update_bytes` advance ONLY
+  at epoch-boundary blocks, and they advance together via a single
+  `apply_epoch_boundary_parameters` call. Within an epoch both are
+  constant.
 - The receiver MUST verify that the params in an epoch-boundary block's
   extension match `compute_expected_parameters(block.height)` byte-for-byte
   via `Parameters.matchParameters`. Mismatch = consensus failure.
+- On `BlockVersion >= Interpreter60Version` (mainnet: v4 onward,
+  first at h=1,628,160), the receiver MUST additionally verify that
+  the block's ID 124 bytes match `active_proposed_update_bytes()`
+  byte-for-byte — JVM `matchParameters60`'s `proposedUpdate`
+  comparison. Before v4 the comparison short-circuits.
+- `active_proposed_update_bytes()` on a fresh chain returns
+  `default_proposed_update_bytes(network)` (the launch-default
+  `ErgoValidationSettingsUpdate(Seq(215, 409), Seq.empty)` encoding).
+  This seed is only consulted before the first boundary; from the
+  first boundary onward the field tracks each accepted block's ID
+  124 bytes. Note: mainnet on-chain ID 124 at h=1,562,624+ carries 3
+  `statusUpdates` that the current encoder does not model, so the
+  6-byte seed does not byte-match mainnet's on-chain bytes.
+  Non-blocking because the v4-gated validator comparison only starts
+  firing at h=1,628,160, by which point the seed has been overwritten
+  by every prior boundary.
 - After reorg past an epoch-boundary block, the chain MUST roll back
-  `active_parameters` to the params at the new tip (recompute or store
-  per-height snapshots).
+  BOTH `active_parameters` AND `active_proposed_update_bytes` to the
+  values at the new tip (recompute or store per-height snapshots).
 
 ## Phase 6: NiPoPoW Proofs (build + verify + install)
 

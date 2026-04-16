@@ -106,23 +106,51 @@ if chain.is_epoch_boundary(header.height) {
             actual: parsed_params,
         });
     }
+
+    // `Parameters.matchParameters60` `proposedUpdate` check. Gated on
+    // BlockVersion >= Interpreter60Version (v4 on mainnet, from
+    // h=1,628,160 onward). The expected value lives on the chain
+    // (`active_proposed_update_bytes()`) and tracks each accepted
+    // boundary block byte-for-byte; before any boundary has been
+    // applied it returns the launch default, but the gate below
+    // means that seed is never the operand in production.
+    if parsed_params.block_version() >= INTERPRETER_60_VERSION
+        && chain.active_proposed_update_bytes() != block_proposed_update.as_slice()
+    {
+        return Err(ValidationError::ProposedUpdateMismatch {
+            height: header.height,
+            expected: chain.active_proposed_update_bytes().to_vec(),
+            actual: block_proposed_update,
+        });
+    }
+
     // Note: chain.apply_epoch_boundary_parameters() is called by the caller
     // AFTER validate_block returns Ok, NOT inside the validator. Validator
     // does not mutate chain state.
 }
 ```
 
-The second argument is the raw `ErgoValidationSettingsUpdate` payload from
-extension key `[0x00, 124]`; it gates the `SubblocksPerBlock` auto-insert at
-BlockVersion==4 activation (rule 409 in the activated update → skip insert).
-See `facts/chain.md` Phase 6 for the full semantics.
+`block_proposed_update` is the raw `ErgoValidationSettingsUpdate` payload
+from extension key `[0x00, 124]`; it gates the `SubblocksPerBlock`
+auto-insert at BlockVersion==4 activation (rule 409 in the activated
+update → skip insert), and above v4 it's additionally the "actual" side of
+the `matchParameters60` `proposedUpdate` byte-for-byte comparison. See
+`facts/chain.md` Phase 6 for the full semantics.
+
+`INTERPRETER_60_VERSION = 4` — JVM constant. The comparison
+short-circuits for BlockVersion 1-3 because pre-v4 mainnet blocks
+carry ID 124 values the current encoder does not model (statusUpdates
+present on-chain since before h=1,562,624). Once the encoder is
+extended to emit statusUpdates, the gate can be relaxed. Tracked as
+follow-up.
 
 The caller (sync pipeline / append-block flow) calls
-`chain.apply_epoch_boundary_parameters(parsed_params)` after the full block
-has been validated and persisted. This keeps the validator stateless w.r.t.
-chain state mutation.
+`chain.apply_epoch_boundary_parameters(parsed_params, block_proposed_update)`
+after the full block has been validated and persisted — both the
+parameters and the ID 124 bytes advance in a single call. This keeps
+the validator stateless w.r.t. chain state mutation.
 
-### New error variant
+### New error variants
 
 ```rust
 ValidationError::ParameterMismatch {
@@ -130,9 +158,17 @@ ValidationError::ParameterMismatch {
     expected: Parameters,
     actual: Parameters,
 }
+
+ValidationError::ProposedUpdateMismatch {
+    height: u32,
+    expected: Vec<u8>,
+    actual: Vec<u8>,
+}
 ```
 
 Added to `validation/src/error.rs` (or wherever `ValidationError` lives).
+`ProposedUpdateMismatch` is only emitted at BlockVersion >=
+Interpreter60Version; before then the check short-circuits.
 
 ## Mining wiring
 
@@ -203,14 +239,18 @@ that auto-translate, mirroring JVM's `voting { 1 = 1000000 }` syntax.
 ## Pipeline wiring
 
 The block-application flow in `src/pipeline.rs` (or wherever the validator
-is driven) must call `chain.apply_epoch_boundary_parameters(params)` AFTER
-a successful epoch-boundary block validation, BEFORE acknowledging the
-block to the rest of the system.
+is driven) must call
+`chain.apply_epoch_boundary_parameters(params, block_proposed_update_bytes)`
+AFTER a successful epoch-boundary block validation, BEFORE acknowledging
+the block to the rest of the system. Both the parameter table and the ID
+124 bytes advance atomically in a single call.
 
 Order:
 1. Validator returns `Ok` for an epoch-boundary block.
 2. Block is persisted to `store/`.
-3. `chain.apply_epoch_boundary_parameters(params)` is called.
+3. `chain.apply_epoch_boundary_parameters(params, proposed_update_bytes)`
+   is called with the parsed params and the block's ID 124 payload
+   (empty `Vec` if absent).
 4. The block is announced to peers / sync state advances.
 
 Step 3 must happen before step 4 — otherwise the next block validates
