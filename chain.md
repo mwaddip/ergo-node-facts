@@ -304,10 +304,14 @@ Chain owns the live instance; consumers query it via `active_parameters()`.
 - **Startup**: Recomputed from chain history during construction (see
   "Startup recomputation" below).
 
-### `compute_expected_parameters(epoch_boundary_height: u32) -> Result<Parameters>`
+### `compute_expected_parameters(epoch_boundary_height: u32, block_proposed_update: &[u8]) -> Result<Parameters>`
 - **Precondition**: `epoch_boundary_height` is the height of an epoch-boundary
   block (the FIRST block of a new epoch). The chain must contain all headers
   in the just-ended voting epoch (`[epoch_boundary_height - voting_length, epoch_boundary_height - 1]`).
+  `block_proposed_update` is the raw payload of the key `[0x00, 124]`
+  (`SoftForkDisablingRules`, i.e. `ErgoValidationSettingsUpdate`) in the
+  epoch-boundary block's extension, if present; empty slice otherwise (JVM
+  treats an absent field as `ErgoValidationSettingsUpdate.empty`).
 - **Postcondition**: Returns the parameters that the block at
   `epoch_boundary_height` MUST emit in its extension. If the block's extension
   contains different parameters, the block is invalid.
@@ -320,6 +324,17 @@ Chain owns the live instance; consumers query it via `active_parameters()`.
      param ID = increase, negative ID = decrease.
   3. Apply soft-fork machinery (see "Soft-fork lifecycle" below).
   4. Return the new `Parameters` table.
+- **`block_proposed_update` usage**: consulted **only** to gate the
+  `BlockVersion == 4` auto-insert of `SubblocksPerBlock` (ID 9), and **only**
+  when the current call is a voting-driven activation (BlockVersion bumped
+  from ≠4 to 4 in this update — not the forced-v2 mainnet activation at
+  `version2_activation_height`). Parsed internally via a minimal
+  `ErgoValidationSettingsUpdate` decoder (just `rulesToDisable`; we don't
+  need `statusUpdates`). If the parsed rule list contains **409**
+  (`exMatchParameters`), the auto-insert is skipped — JVM mainnet activates
+  rule 409 at the same boundary as the v6 BlockVersion bump, so the insert
+  fires only at the **next** boundary. At non-activation boundaries the
+  payload is ignored entirely.
 - **Determinism**: For any two correct implementations given the same chain,
   the output is byte-identical. This is the consensus rule.
 

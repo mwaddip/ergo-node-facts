@@ -93,7 +93,12 @@ Inserted between section parsing and AD-proof verification:
 ```rust
 if chain.is_epoch_boundary(header.height) {
     let parsed_params = parse_parameters_from_extension(&parsed_extension)?;
-    let expected_params = chain.compute_expected_parameters(header.height)?;
+    let block_proposed_update =
+        chain::voting::extract_disabling_rules_from_kv(&parsed_extension.fields);
+    let expected_params = chain.compute_expected_parameters(
+        header.height,
+        &block_proposed_update,
+    )?;
     if parsed_params != expected_params {
         return Err(ValidationError::ParameterMismatch {
             height: header.height,
@@ -106,6 +111,11 @@ if chain.is_epoch_boundary(header.height) {
     // does not mutate chain state.
 }
 ```
+
+The second argument is the raw `ErgoValidationSettingsUpdate` payload from
+extension key `[0x00, 124]`; it gates the `SubblocksPerBlock` auto-insert at
+BlockVersion==4 activation (rule 409 in the activated update → skip insert).
+See `facts/chain.md` Phase 6 for the full semantics.
 
 The caller (sync pipeline / append-block flow) calls
 `chain.apply_epoch_boundary_parameters(parsed_params)` after the full block
@@ -150,7 +160,12 @@ The mining task in `src/main.rs` decides which mode based on
 ```rust
 let candidate_height = parent.height + 1;
 let boundary_params = if chain.is_epoch_boundary(candidate_height) {
-    Some(chain.compute_expected_parameters(candidate_height)?)
+    // `proposed_update_bytes` is the ID-124 payload the miner plans to emit
+    // for this boundary. At a voting-driven BlockVersion==4 activation the
+    // miner must emit the activated update (including rule 409) or chain
+    // will diverge from JVM — see `facts/chain.md` Phase 6.
+    let proposed_update_bytes: &[u8] = miner_proposed_update_for(candidate_height);
+    Some(chain.compute_expected_parameters(candidate_height, proposed_update_bytes)?)
 } else {
     None
 };
