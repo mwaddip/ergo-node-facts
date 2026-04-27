@@ -200,6 +200,59 @@ Periodic SyncInfo (30s) to detect new blocks. Reacts to Inv with ModifierRequest
 Receives pipeline progress for logging. The control channel is checked with
 `biased;` priority in the synced loop too — a `Reorg` while synced must not be missed.
 
+### At-tip Storage Reopen (v0.4.x)
+
+Operators can reduce steady-state RSS at chain tip by reopening the
+AVL state DB with a smaller redb cache once sync has caught up.
+HeaderSync hosts the sync side of a one-shot handshake; the main
+crate owns the storage lifecycle.
+
+**Channels (set via `HeaderSync::set_at_tip_channels`, post-construction):**
+
+- `at_tip_request_tx: oneshot::Sender<u32>` — sync sends the
+  flushed validator's height when ready to swap.
+- `at_tip_validator_rx: oneshot::Receiver<V>` — sync receives the
+  rebuilt validator (built against the new storage handle) and
+  resumes.
+
+If both channels are unset, the at-tip path is a no-op and sync
+runs the cold-sync settings indefinitely.
+
+**`SyncConfig` overrides** (all `Option<...>`; `None` = keep
+cold-sync value):
+
+- `synced_flush_heap_threshold_mb: Option<u64>`
+- `synced_flush_max_blocks: Option<u32>`
+- `synced_flush_min_blocks: Option<u32>` — recommended ≥ 5; with
+  per-block flushing (= 1) a remove-then-reinsert AVL pattern across
+  two adjacent blocks can slip past the prover's dirty-node tracking
+  and orphan a node on disk. The wider window lets the pattern
+  cancel within prover state before any flush.
+
+**Gate** (`AT_TIP_WINDOW = 16`): the handshake fires when
+`validator.validated_height() + AT_TIP_WINDOW >= chain.chain_height()`.
+Re-evaluated on each `section_ticker` tick (every 2s) so the
+transition fires the moment the validator catches up — without
+bouncing through `sync_from_peer` to re-enter `synced()`.
+Idempotent via `Option::take`: once the handshake fires, the
+channels are consumed and re-entries are no-ops.
+
+**Sequence:**
+
+1. `validator.flush()` to persist any in-memory write-tx state.
+   Failure reinstates the old validator and skips the rebuild.
+2. `drop(validator)` — releases the AVL storage `Arc<Database>`.
+   All other holders (mempool, REST API, mining) must release
+   their `Arc<SnapshotReader>`s in parallel for redb's exclusive
+   file lock to free.
+3. `at_tip_request_tx.send(height)` → main reopens with
+   `synced_cache_mb`, builds new validator at `height`.
+4. `at_tip_validator_rx.await` → receive new validator.
+5. `debug_assert_eq!(new.validated_height(), height)`.
+
+**At-tip flush settings** (the cheap part) are swapped at the same
+time as the storage reopen; same gate, same idempotence.
+
 ## JVM peer behavior (observed)
 
 Critical findings from debugging sync against JVM 6.0.3 peers:

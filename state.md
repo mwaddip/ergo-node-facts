@@ -555,6 +555,53 @@ differ (prover vs verifier, persistent vs ephemeral).
 The generated AD proof from step 5 can optionally be served to digest-mode
 peers, but this is a future concern (Phase 6).
 
+## At-tip storage reopen contract (v0.4.x)
+
+Operators may reopen the storage with a smaller redb cache once chain
+sync reaches tip (drives RSS down by ~80% on mainnet at-tip). The
+mechanism lives outside this crate (sync triggers, main rebuilds), but
+the state crate's contract enables it through three guarantees:
+
+1. **Drop-and-reopen safety.** `RedbAVLStorage` holds an
+   `Arc<Database>` and exposes `snapshot_reader()` that clones it.
+   When all `Arc<Database>` holders (the storage itself plus every
+   `SnapshotReader` issued from it) drop, redb releases the OS-level
+   exclusive file lock and a fresh `RedbAVLStorage::open(...)` on
+   the same path with a different `cache_size` succeeds. The state
+   crate makes no claims about *who* releases the Arcs — only that
+   when they're all gone, reopen works.
+
+2. **Version() and block_height() persistence across reopen.** A
+   freshly-opened storage on a path that already had committed data
+   reports the most recent committed `version()` and `block_height()`
+   without further action. The caller can `storage.rollback(&v)` to
+   the current version (no-op short-circuit) to materialize the
+   prover's root, then resume normal operation. Same shape as the
+   genesis-resume branch.
+
+3. **Rollback target stability.** Versions in `rollback_versions()`
+   from the old storage instance are preserved across reopen
+   (versions live in the persisted UNDO_TABLE, not in `RedbAVLStorage`
+   in-memory state). A reopen does not invalidate `rollback_versions`.
+
+The integrator side: main repo holds a `SwappableReader` (a
+`parking_lot::RwLock<Option<Arc<SnapshotReader>>>`) shared with
+mempool, REST API, and the snapshot dump trigger. To reopen:
+
+- `swap.take()` — releases the wrapper's Arc.
+- The validator (which owns the storage) is dropped — releases its
+  Arc.
+- All other Arc holders must use the wrapper's `current()` (which
+  returns `Option<Arc<SnapshotReader>>` per call), not cache the Arc
+  across `.await` points.
+- `RedbAVLStorage::open(path, params, keep_versions, new_cache)`
+  succeeds.
+- Build a new prover via the resume pattern; `swap.install(new_sr)`.
+
+If any Arc leaks past the swap, redb's file lock blocks the new
+open; the integrator's `open_state_with_retry(30 × 200ms = 6s budget)`
+covers transient holders (e.g. an in-flight snapshot dump).
+
 ## Does NOT own
 
 - Block parsing or validation — that's `validation/`

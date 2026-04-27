@@ -500,6 +500,48 @@ Pure calculation, no state access.
 
 ---
 
+### Debug
+
+#### `GET /debug/memory`
+
+Memory diagnostics for ops. Process-level (RSS, peak, anon vs file)
++ jemalloc stats (allocated, active, resident, retained, metadata) +
+component-level estimates (chain header count and rough size,
+mempool tx count). Useful for tracking RSS vs allocated divergence
+(THP retention, fragmentation, etc.).
+
+**Response 200:**
+```json
+{
+  "process": {
+    "rssAnonBytes": 882192384,
+    "rssFileBytes": 15355904,
+    "rssTotalBytes": 897548288,
+    "rssPeakBytes": 1730408448,
+    "vmSizeBytes": 2587922432,
+    "pssBytes": 895396864
+  },
+  "jemalloc": {
+    "allocatedBytes": 411834448,
+    "activeBytes": 446201856,
+    "residentBytes": 477978624,
+    "retainedBytes": 1441718272,
+    "metadataBytes": 18261136
+  },
+  "components": {
+    "chainHeaderEstimateBytes": 1417688800,
+    "chainHeaderCount": 1772111,
+    "mempoolTxCount": 0
+  }
+}
+```
+
+**Notes:** `jemalloc` block is `null` when not built with the
+`jemalloc` feature. `process.*` reads `/proc/self/status` and
+`/proc/self/smaps_rollup` — Linux-only.
+
+---
+
 ## Endpoints NOT Implemented (First Release)
 
 | JVM Endpoint Family | Reason |
